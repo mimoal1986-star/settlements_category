@@ -42,11 +42,12 @@ def clean_region(region):
     s = s.replace("Ханты-Мансийский автономный округ - Югра", "Ханты-Мансийский автономный округ")
     return s
 
-def photon_geocode(name, region):
-    """Photon: возвращает (lat, lon) или (None, None)."""
+def photon_geocode(name):
+    """Photon: возвращает (lat, lon) или (None, None).
+    Регион НЕ используется — Photon не умеет фильтровать по нему.
+    """
     queries = [
-        {"q": f"{name} {region} Россия", "limit": 5, "lang": "ru"},
-        {"q": f"{name} {region}", "limit": 5, "lang": "ru"},
+        {"q": f"{name}, Россия", "limit": 5, "lang": "ru"},
         {"q": f"{name}", "limit": 5, "lang": "ru"},
     ]
     for params in queries:
