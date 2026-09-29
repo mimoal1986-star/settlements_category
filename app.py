@@ -54,16 +54,31 @@ def match_settlements(user_df, ds_df):
     Простой матчинг: ключ (город, область) == (settlement, region).
     Только сжатие пробелов. Регион обязателен.
     """
-    # Нормализуем датасет
+    def to_float(v):
+        if pd.isna(v):
+            return np.nan
+        if isinstance(v, (int, float, np.integer, np.floating)):
+            return float(v)
+        try:
+            return float(str(v).replace(",", "."))
+        except (ValueError, TypeError):
+            return np.nan
+
     ds = ds_df.copy()
     ds["_s"] = ds["settlement"].apply(squeeze).str.lower()
     ds["_r"] = ds["region"].apply(squeeze).str.lower()
 
+    # Приводим координаты к float
+    ds["_lat"] = [to_float(v) for v in ds["latitude_dd"].values]
+    ds["_lon"] = [to_float(v) for v in ds["longitude_dd"].values]
+
     # Словарь: (settlement, region) → (lat, lon)
     sett_map = {}
     for s, r, lat, lon in zip(ds["_s"].values, ds["_r"].values,
-                              ds["latitude_dd"].values, ds["longitude_dd"].values):
+                              ds["_lat"].values, ds["_lon"].values):
         if not s or not r:
+            continue
+        if pd.isna(lat) or pd.isna(lon):
             continue
         key = (s, r)
         if key not in sett_map:
