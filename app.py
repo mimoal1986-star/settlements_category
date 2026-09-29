@@ -179,7 +179,7 @@ if uploaded:
             if key in cache and cache[key][0] is not None and not pd.isna(cache[key][0]):
                 lat, lon = cache[key]
             else:
-                lat, lon = photon_geocode(row["_name_clean"], row["_region_clean"])
+                lat, lon = photon_geocode(row["_name_clean"])
                 if lat is not None:
                     cache[key] = (lat, lon)
                     if len(cache) % 20 == 0:
