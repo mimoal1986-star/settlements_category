@@ -7,10 +7,10 @@ import io
 R_EARTH = 6371.0
 
 NEW_COLS = [
-    "Для НП 3,4 → НП 1, 2 Имя НП",
-    "Для НП 3,4 → НП 1, 2 расстояние",
-    "Для НП 5,6 → НП 3, 4 Имя НП",
-    "Для НП 5,6 → НП 3, 4 расстояние",
+    "Для НП 3-6 → НП 1, 2 Имя НП",
+    "Для НП 3-6 → НП 1, 2 расстояние",
+    "Для НП 5-6 → НП 3, 4 Имя НП",
+    "Для НП 5-6 → НП 3, 4 расстояние",
     "Для НП 6 → НП 5 Имя НП",
     "Для НП 6 → НП 5 расстояние",
 ]
@@ -70,7 +70,7 @@ CITY_COORDS = {
 
 
 def squeeze(s):
-    """Только сжатие пробелов и strip."""
+    """Сжатие пробелов и strip."""
     if pd.isna(s):
         return ""
     return re.sub(r"\s+", " ", str(s).strip())
@@ -124,7 +124,6 @@ def match_settlements(user_df, ds_df):
     ds["_lat"] = [to_float(v) for v in ds["latitude_dd"].values]
     ds["_lon"] = [to_float(v) for v in ds["longitude_dd"].values]
 
-    # Словарь из справочника
     sett_map = {}
     for s, r, lat, lon in zip(ds["_s"].values, ds["_r"].values,
                               ds["_lat"].values, ds["_lon"].values):
@@ -136,7 +135,6 @@ def match_settlements(user_df, ds_df):
         if key not in sett_map:
             sett_map[key] = (lat, lon)
 
-    # Матчинг
     out = user_df.copy()
     out["lat"] = np.nan
     out["lon"] = np.nan
@@ -212,7 +210,6 @@ if user_file and ds_file:
     st.dataframe(ds_df.head(5), use_container_width=True)
     st.caption(f"Строк: {len(ds_df)}")
 
-    # Проверка колонок
     required_user = ["город", "область", "категория"]
     required_ds = ["settlement", "region", "latitude_dd", "longitude_dd"]
 
@@ -261,25 +258,31 @@ if user_file and ds_file:
                 def sub(cats):
                     return work[has_coords & work["_cat"].isin(cats)].copy()
 
+                # Кандидаты
                 g12 = sub([1, 2])
                 g34 = sub([3, 4])
                 g5  = sub([5])
-                g56 = sub([5, 6])
-                g6  = sub([6])
+                # Источники
+                g3456 = sub([3, 4, 5, 6])   # для правила "3-6 → 1,2"
+                g56   = sub([5, 6])          # для правила "5-6 → 3,4"
+                g6    = sub([6])             # для правила "6 → 5"
 
                 for c in NEW_COLS:
                     work[c] = None
 
-                if len(g34) and len(g12):
-                    names, dists = find_nearest(g34, g12)
-                    work.loc[g34.index, NEW_COLS[0]] = names
-                    work.loc[g34.index, NEW_COLS[1]] = np.round(dists, 2)
+                # Правило 1: НП 3-6 → ближайший из 1, 2
+                if len(g3456) and len(g12):
+                    names, dists = find_nearest(g3456, g12)
+                    work.loc[g3456.index, NEW_COLS[0]] = names
+                    work.loc[g3456.index, NEW_COLS[1]] = np.round(dists, 2)
 
+                # Правило 2: НП 5-6 → ближайший из 3, 4
                 if len(g56) and len(g34):
                     names, dists = find_nearest(g56, g34)
                     work.loc[g56.index, NEW_COLS[2]] = names
                     work.loc[g56.index, NEW_COLS[3]] = np.round(dists, 2)
 
+                # Правило 3: НП 6 → ближайший из 5
                 if len(g6) and len(g5):
                     names, dists = find_nearest(g6, g5)
                     work.loc[g6.index, NEW_COLS[4]] = names
