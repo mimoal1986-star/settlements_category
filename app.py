@@ -1,16 +1,9 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import requests
-import time
-import os
 import re
 import io
 
-# ---------- Константы ----------
-CACHE_FILE = "coordinates.xlsx"
-PHOTON_URL = "https://photon.komoot.io/api/"
-HEADERS = {"User-Agent": "np-distance-calc/1.0"}
 R_EARTH = 6371.0
 
 NEW_COLS = [
@@ -22,71 +15,52 @@ NEW_COLS = [
     "Для НП 6 → НП 5 расстояние",
 ]
 
-# ---------- Утилиты ----------
-def clean_name(name):
-    if pd.isna(name):
+# ---------- Нормализация ----------
+def norm_region(s):
+    """Нормализует название региона для сопоставления."""
+    if pd.isna(s):
         return ""
-    s = str(name).strip()
-    s = re.sub(r"^(город|г\.?|пгт\.?|рп\.?|гт\.?|село|с\.?|посёлок|поселок|п\.|дп\.?|д\.?)\s+",
-               "", s, flags=re.IGNORECASE)
-    s = re.sub(r"\s+(дп|рп|пгт)\.?$", "", s, flags=re.IGNORECASE)
-    return s.strip()
-
-def clean_region(region):
-    if pd.isna(region):
-        return ""
-    s = str(region).strip()
+    s = str(s).strip().lower()
+    s = s.replace("ё", "е")
+    s = s.replace("—", "-").replace("–", "-")
+    s = re.sub(r"\s*-\s*", "-", s)              # FIX: "Осетия - Алания" → "Осетия-Алания"
     s = re.sub(r"\s+", " ", s)
-    s = s.replace("Город федерального значения Москва", "Москва")
-    s = s.replace("Город федерального значения Санкт-Петербург", "Санкт-Петербург")
-    s = s.replace("Ханты-Мансийский автономный округ - Югра", "Ханты-Мансийский автономный округ")
+    # Убираем общие слова (без мёртвого "г\.")
+    s = re.sub(
+        r"\b(область|обл|край|республика|респ|автономный округ|ао|"
+        r"город федерального значения|город|г)\b",
+        "", s
+    )
+    s = re.sub(r"\s+", " ", s).strip(" -,")
     return s
 
-def photon_geocode(name):
-    """Photon: возвращает (lat, lon) или (None, None).
-    Регион НЕ используется — Photon не умеет фильтровать по нему.
-    """
-    queries = [
-        {"q": f"{name}, Россия", "limit": 5, "lang": "ru"},
-        {"q": f"{name}", "limit": 5, "lang": "ru"},
-    ]
-    for params in queries:
-        try:
-            r = requests.get(PHOTON_URL, params=params, headers=HEADERS, timeout=15)
-            if r.status_code == 200:
-                feats = r.json().get("features", [])
-                for f in feats:
-                    coords = f.get("geometry", {}).get("coordinates")
-                    if not coords or len(coords) < 2:
-                        continue
-                    lon, lat = coords[0], coords[1]
-                    props = f.get("properties", {})
-                    cc = (props.get("countrycode") or "").upper()
-                    country = (props.get("country") or "").lower()
-                    if cc in ("RU", "") or "росси" in country:
-                        return float(lat), float(lon)
-        except Exception:
-            pass
-        time.sleep(0.3)
-    return None, None
 
-# ---------- Кэш (Excel) ----------
-def save_cache(cache_map):
-    if not cache_map:
-        return
-    rows = [{"name": k[0], "region": k[1], "lat": v[0], "lon": v[1]}
-            for k, v in cache_map.items()]
-    pd.DataFrame(rows).to_excel(CACHE_FILE, index=False, engine="openpyxl")
+def norm_name(s):
+    """Нормализует название НП для сопоставления."""
+    if pd.isna(s):
+        return ""
+    s = str(s).strip().lower()
+    s = s.replace("ё", "е")
+    s = s.replace("—", "-").replace("–", "-")
 
-def load_cache_from_disk():
-    if os.path.exists(CACHE_FILE):
-        try:
-            c = pd.read_excel(CACHE_FILE, engine="openpyxl")
-            return {(str(row["name"]), str(row["region"])): (row["lat"], row["lon"])
-                    for _, row in c.iterrows()}
-        except Exception:
-            return {}
-    return {}
+    # FIX: "им." / "имени" — приводим к единому виду, потом убираем
+    s = re.sub(r"\bим\.\s*", "", s)
+    s = re.sub(r"\bимени\s+", "", s)
+    # FIX: убираем инициалы "в.и." → ""
+    s = re.sub(r"\b[а-я]\.\s*[а-я]\.\s*", "", s)
+    s = re.sub(r"\b[а-я]\.\s*", "", s)
+
+    # Префиксы типа "город", "пгт", "рп", "дп" и т.д. — в начале
+    s = re.sub(
+        r"^(город|г|пгт|рп|гт|село|с|посёлок|поселок|п|дп|д|кп|к\.п\.|"
+        r"деревня|д\.)\s*\.?\s+",
+        "", s
+    )
+    # FIX: добавили "кп", "гт" в финальный regex
+    s = re.sub(r"\s+(дп|рп|пгт|г|кп|гт)\.?$", "", s)
+    s = re.sub(r"\s+", " ", s)
+    return s.strip()
+
 
 def haversine_matrix(lat1, lon1, lat2, lon2):
     lat1 = np.radians(np.asarray(lat1, dtype=float))[:, None]
@@ -99,7 +73,9 @@ def haversine_matrix(lat1, lon1, lat2, lon2):
     a = np.clip(a, 0, 1)
     return 2 * R_EARTH * np.arcsin(np.sqrt(a))
 
+
 def find_nearest(src_df, tgt_df):
+    """Возвращает (names, dists). Имена — из колонки _name_orig (оригинальные)."""
     n = len(src_df)
     names = np.array([None] * n, dtype=object)
     dists = np.full(n, np.nan)
@@ -108,123 +84,224 @@ def find_nearest(src_df, tgt_df):
     D = haversine_matrix(src_df["lat"].values, src_df["lon"].values,
                          tgt_df["lat"].values, tgt_df["lon"].values)
     idx = D.argmin(axis=1)
-    names = tgt_df["_name_clean"].values[idx]
+    # FIX: возвращаем оригинальные имена, а не нормализованные
+    names = tgt_df["_name_orig"].values[idx]
     dists = D[np.arange(n), idx]
     return names, dists
+
+
+# ---------- Матчинг ----------
+def match_settlements(user_df, dataset_df,
+                      user_name_col, user_region_col,
+                      ds_name_col, ds_region_col,
+                      ds_lat_col, ds_lon_col,
+                      ds_pop_col=None):
+    """
+    Возвращает user_df с колонками lat, lon, match_status.
+    Проходы:
+      1. Точное (name_norm + region_norm)
+      2. name_norm + region_norm, если в регионе один вариант
+      3. name_norm уникально во всей базе
+      4. Дубли в регионе → помечаем, координаты не заполняем
+    """
+    ds = dataset_df.copy()
+    ds["_name_norm"] = ds[ds_name_col].apply(norm_name)
+    ds["_region_norm"] = ds[ds_region_col].apply(norm_region)
+    ds = ds[ds["_name_norm"] != ""].copy()
+
+    # Словарь 1: (name, region) → список (lat, lon, population)
+    exact_map = {}
+    for _, r in ds.iterrows():
+        key = (r["_name_norm"], r["_region_norm"])
+        exact_map.setdefault(key, []).append(
+            (r[ds_lat_col], r[ds_lon_col],
+             r[ds_pop_col] if ds_pop_col else 0)
+        )
+
+    # Словарь 2: name → список (region, lat, lon, population)
+    name_map = {}
+    for _, r in ds.iterrows():
+        name_map.setdefault(r["_name_norm"], []).append(
+            (r["_region_norm"], r[ds_lat_col], r[ds_lon_col],
+             r[ds_pop_col] if ds_pop_col else 0)
+        )
+
+    out = user_df.copy()
+    out["lat"] = np.nan
+    out["lon"] = np.nan
+    out["match_status"] = ""
+
+    for i, row in out.iterrows():
+        u_name = norm_name(row[user_name_col])
+        u_region = norm_region(row[user_region_col])
+
+        if not u_name or not u_region:
+            out.at[i, "match_status"] = "пусто в исходнике"
+            continue
+
+        # Проход 1 + 2: точное по (name, region)
+        key = (u_name, u_region)
+        if key in exact_map:
+            variants = exact_map[key]
+            if len(variants) == 1:
+                lat, lon, _ = variants[0]
+                out.at[i, "lat"] = lat
+                out.at[i, "lon"] = lon
+                out.at[i, "match_status"] = "точно"
+            else:
+                # FIX: дубли в датасете — берём с наибольшим населением,
+                # но помечаем
+                best = max(variants, key=lambda v: v[2] if pd.notna(v[2]) else 0)
+                out.at[i, "lat"] = best[0]
+                out.at[i, "lon"] = best[1]
+                out.at[i, "match_status"] = f"дубль в датасете ({len(variants)})"
+            continue
+
+        # Проход 3: по имени, если в регионе один кандидат
+        candidates = name_map.get(u_name, [])
+        in_region = [c for c in candidates if c[0] == u_region]
+        if len(in_region) == 1:
+            out.at[i, "lat"] = in_region[0][1]
+            out.at[i, "lon"] = in_region[0][2]
+            out.at[i, "match_status"] = "по названию+региону"
+            continue
+        if len(in_region) > 1:
+            # FIX: дубли в регионе — берём крупнейший, помечаем
+            best = max(in_region, key=lambda v: v[3] if pd.notna(v[3]) else 0)
+            out.at[i, "lat"] = best[1]
+            out.at[i, "lon"] = best[2]
+            out.at[i, "match_status"] = f"дубль в регионе ({len(in_region)})"
+            continue
+
+        # Проход 4: по имени без региона, если во всей базе один вариант
+        if len(candidates) == 1:
+            out.at[i, "lat"] = candidates[0][1]
+            out.at[i, "lon"] = candidates[0][2]
+            out.at[i, "match_status"] = "по названию (без региона)"
+            continue
+
+        out.at[i, "match_status"] = "не найдено"
+
+    return out
+
 
 # ---------- UI ----------
 st.set_page_config(page_title="Ближайшие НП", layout="wide")
 st.title("Расчёт ближайших населённых пунктов")
 
-with st.sidebar:
-    st.markdown("### Кэш координат")
-    st.caption(f"Файл на диске: `{CACHE_FILE}`")
-    if st.button("🗑 Очистить кэш"):
-        if os.path.exists(CACHE_FILE):
-            os.remove(CACHE_FILE)
-        st.success("Кэш очищен")
-
-# --- Загрузчик исходного файла ---
-uploaded = st.file_uploader(
-    "Загрузите Excel или CSV с населёнными пунктами",
+st.markdown("### 1. Загрузите список НП")
+user_file = st.file_uploader(
+    "Ваш Excel/CSV со списком НП",
     type=["xlsx", "xls", "csv"],
-    key="data_upload"
+    key="user_file"
 )
 
-if uploaded:
-    # --- Чтение файла ---
-    if uploaded.name.lower().endswith(".csv"):
+st.markdown("### 2. Загрузите датасет с координатами")
+ds_file = st.file_uploader(
+    "Датасет (region, settlement, latitude_dd, longitude_dd)",
+    type=["xlsx", "xls", "csv"],
+    key="ds_file"
+)
+
+
+# FIX: чтение через BytesIO — надёжнее, чем seek
+def read_any(f):
+    raw = f.read()
+    if f.name.lower().endswith(".csv"):
         try:
-            df = pd.read_csv(uploaded, encoding="utf-8-sig")
+            return pd.read_csv(io.BytesIO(raw), encoding="utf-8-sig")
         except (UnicodeDecodeError, UnicodeError):
-            uploaded.seek(0)
-            df = pd.read_csv(uploaded, encoding="cp1251")
-    else:
-        df = pd.read_excel(uploaded, sheet_name=0)
+            return pd.read_csv(io.BytesIO(raw), encoding="cp1251")
+    return pd.read_excel(io.BytesIO(raw), sheet_name=0)
 
-    st.subheader("Предпросмотр")
-    st.dataframe(df.head(15), use_container_width=True)
-    st.caption(f"Всего строк: {len(df)}")
 
-    cols = df.columns.tolist()
+if user_file and ds_file:
+    user_df = read_any(user_file)
+    ds_df = read_any(ds_file)
 
-    def pick(name, default=0):
+    st.subheader("Ваш список")
+    st.dataframe(user_df.head(5), use_container_width=True)
+    st.caption(f"Строк: {len(user_df)}")
+
+    st.subheader("Датасет с координатами")
+    st.dataframe(ds_df.head(5), use_container_width=True)
+    st.caption(f"Строк: {len(ds_df)}")
+
+    st.markdown("### 3. Укажите колонки")
+
+    u_cols = user_df.columns.tolist()
+    d_cols = ds_df.columns.tolist()
+
+    def pick(cols, name, default=0):
         for i, c in enumerate(cols):
             if str(c).strip().lower() == name.lower():
                 return i
         return default
 
-    name_col   = st.selectbox("Колонка с названием НП", cols, index=pick("город"))
-    region_col = st.selectbox("Колонка с областью",   cols, index=pick("область"))
-    cat_col    = st.selectbox("Колонка с категорией", cols, index=pick("категория"))
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        u_name_col   = st.selectbox("Ваш: название", u_cols, index=pick(u_cols, "город"))
+        u_region_col = st.selectbox("Ваш: регион",   u_cols, index=pick(u_cols, "область"))
+        u_cat_col    = st.selectbox("Ваш: категория", u_cols, index=pick(u_cols, "категория"))
+    with c2:
+        d_name_col   = st.selectbox("Датасет: название", d_cols, index=pick(d_cols, "settlement"))
+        d_region_col = st.selectbox("Датасет: регион",   d_cols, index=pick(d_cols, "region"))
+    with c3:
+        d_lat_col = st.selectbox("Датасет: широта",  d_cols, index=pick(d_cols, "latitude_dd"))
+        d_lon_col = st.selectbox("Датасет: долгота", d_cols, index=pick(d_cols, "longitude_dd"))
+        d_pop_col = st.selectbox(
+            "Датасет: население (опц.)",
+            ["— нет —"] + d_cols,
+            index=(["— нет —"] + d_cols).index("population")
+                  if "population" in d_cols else 0
+        )
+        d_pop_col = None if d_pop_col == "— нет —" else d_pop_col
 
-    # --- Шаг 1. Геокодинг ---
-    if st.button("1️⃣ Геокодировать (Photon)"):
-        work = df.copy()
-        work["_name_clean"]   = work[name_col].apply(clean_name)
-        work["_region_clean"] = work[region_col].apply(clean_region)
+    # --- Матчинг ---
+    if st.button("1️⃣ Сопоставить и получить координаты"):
+        with st.spinner("Сопоставляем..."):
+            matched = match_settlements(
+                user_df, ds_df,
+                u_name_col, u_region_col,
+                d_name_col, d_region_col,
+                d_lat_col, d_lon_col,
+                d_pop_col,
+            )
+        # FIX: сохраняем user_df и все нужные колонки в session_state
+        st.session_state["matched"]     = matched
+        st.session_state["user_df"]     = user_df
+        st.session_state["u_cat_col"]   = u_cat_col
+        st.session_state["u_name_col"]  = u_name_col
+        st.session_state["u_region_col"] = u_region_col
 
-        skip_mask = work["_name_clean"].eq("") | work["_region_clean"].eq("")
-        to_geo = work[~skip_mask].copy()
+        # FIX: правильная статистика
+        stats = matched["match_status"].value_counts().reset_index()
+        stats.columns = ["статус", "количество"]
+        st.success("Готово")
+        st.write("**Статусы сопоставления:**")
+        st.dataframe(stats, use_container_width=True)
 
-        cache = load_cache_from_disk()
-
-        lats, lons = [], []
-        progress = st.progress(0.0)
-        status = st.empty()
-        not_found = []
-
-        for i, row in to_geo.iterrows():
-            key = (row["_name_clean"], row["_region_clean"])
-            if key in cache and cache[key][0] is not None and not pd.isna(cache[key][0]):
-                lat, lon = cache[key]
-            else:
-                lat, lon = photon_geocode(row["_name_clean"])
-                if lat is not None:
-                    cache[key] = (lat, lon)
-                    if len(cache) % 20 == 0:
-                        save_cache(cache)
-
-            if lat is None:
-                not_found.append((row["_name_clean"], row["_region_clean"]))
-
-            lats.append(lat if lat is not None else np.nan)
-            lons.append(lon if lon is not None else np.nan)
-            progress.progress(min(len(lats) / max(len(to_geo), 1), 1.0))
-            status.text(f"Геокодинг {len(lats)}/{len(to_geo)} — не найдено: {len(not_found)}")
-
-        save_cache(cache)
-
-        work["lat"] = np.nan
-        work["lon"] = np.nan
-        work.loc[to_geo.index, "lat"] = lats
-        work.loc[to_geo.index, "lon"] = lons
-
-        st.session_state["df_geo"] = work
-        st.session_state["not_found"] = not_found
-        st.session_state["cols_used"] = (name_col, region_col, cat_col)
-        st.session_state["orig_cols"] = list(df.columns)
-
-        st.success(f"Готово. Не найдено: {len(not_found)}")
-        if not_found:
-            st.warning("Не удалось геокодировать:")
-            st.dataframe(pd.DataFrame(not_found, columns=["Название", "Область"]),
+        not_found = matched[matched["match_status"] == "не найдено"]
+        if len(not_found):
+            st.warning(f"Не найдено: {len(not_found)} НП")
+            st.dataframe(not_found[[u_name_col, u_region_col]].head(50),
                          use_container_width=True)
 
-        buf = io.BytesIO()
-        work.to_excel(buf, index=False, engine="openpyxl")
-        st.download_button("⬇ Скачать geocoded.xlsx", buf.getvalue(),
-                           "geocoded.xlsx",
-                           "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        st.subheader("Предпросмотр результата")
+        st.dataframe(matched.head(20), use_container_width=True)
 
-    # --- Шаг 2. Расчёт ---
-    if "df_geo" in st.session_state:
+    # --- Расчёт ---
+    if "matched" in st.session_state:
         if st.button("2️⃣ Рассчитать и получить Excel"):
-            work = st.session_state["df_geo"].copy()
-            name_col, region_col, cat_col = st.session_state["cols_used"]
-            orig_cols = st.session_state["orig_cols"]
+            work = st.session_state["matched"].copy()
+            user_df = st.session_state["user_df"]   # FIX: из session_state
+            u_cat_col = st.session_state["u_cat_col"]
+            u_name_col = st.session_state["u_name_col"]
 
-            work["_cat"] = pd.to_numeric(work[cat_col], errors="coerce")
+            # FIX: оригинальное имя для вывода + нормализованное для матчинга
+            work["_name_orig"]  = work[u_name_col].astype(str)
+            work["_name_clean"] = work[u_name_col].apply(norm_name)
+            work["_cat"] = pd.to_numeric(work[u_cat_col], errors="coerce")
             has_coords = work["lat"].notna() & work["lon"].notna()
 
             def sub(cats):
@@ -254,22 +331,21 @@ if uploaded:
                 work.loc[g6.index, NEW_COLS[4]] = names
                 work.loc[g6.index, NEW_COLS[5]] = np.round(dists, 2)
 
-            result = work.drop(columns=["_name_clean", "_region_clean", "_cat"],
-                               errors="ignore")
-
-            sheet_all = result.copy()
-            safe_orig = [c for c in orig_cols if c in result.columns]
-            sheet_res = result[safe_orig + NEW_COLS].copy()
+            # Собираем финальные колонки
+            orig_cols = [c for c in user_df.columns if c in work.columns]
+            sheet_res = work[orig_cols + ["lat", "lon", "match_status"] + NEW_COLS].copy()
 
             buf = io.BytesIO()
             with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-                sheet_all.to_excel(writer, sheet_name="Все_НП", index=False)
                 sheet_res.to_excel(writer, sheet_name="Результат", index=False)
+                not_found = work[work["match_status"] == "не найдено"]
+                if len(not_found):
+                    cols = [st.session_state["u_name_col"],
+                            st.session_state["u_region_col"]]
+                    not_found[cols].to_excel(
+                        writer, sheet_name="Не_найдено", index=False)
 
             st.success("Готово!")
-            st.subheader("Предпросмотр «Результат»")
-            st.dataframe(sheet_res.head(30), use_container_width=True)
-
             st.download_button(
                 "⬇ Скачать result.xlsx",
                 buf.getvalue(),
