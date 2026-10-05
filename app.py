@@ -3,6 +3,7 @@ import pandas as pd
 import numpy as np
 import re
 import io
+from datetime import datetime, date
 
 R_EARTH = 6371.0
 
@@ -79,6 +80,7 @@ CITY_COORDS = {
 }
 
 
+# ==================== УТИЛИТЫ ====================
 def squeeze(s):
     if pd.isna(s):
         return ""
@@ -86,7 +88,7 @@ def squeeze(s):
 
 
 def is_empty(v):
-    """True, если значение пустое (None, NaN, NaT или пустая строка)."""
+    """True, если значение пустое (None, NaN, NaT, datetime, пустая строка, ' - ')."""
     if v is None:
         return True
     try:
@@ -94,7 +96,40 @@ def is_empty(v):
             return True
     except (TypeError, ValueError):
         pass
-    return str(v).strip() == ""
+    if isinstance(v, (datetime, date)):
+        return False  # дата — не пусто, но бесполезна для координат
+    s = str(v).strip()
+    if s == "" or s == "-" or s == "—":
+        return True
+    return False
+
+
+def to_float(v):
+    """
+    Приводит значение к float или NaN.
+    Явно отсекает datetime, NaT, мусор.
+    """
+    if v is None:
+        return np.nan
+    # datetime → NaN (Excel испортил координаты)
+    if isinstance(v, (datetime, date)):
+        return np.nan
+    try:
+        if pd.isna(v):
+            return np.nan
+    except (TypeError, ValueError):
+        pass
+    if isinstance(v, (int, float, np.integer, np.floating)):
+        return float(v)
+    s = str(v).strip()
+    if s == "" or s == "-" or s == "—":
+        return np.nan
+    # Убираем пробелы-разделители тысяч, заменяем запятую на точку
+    s2 = s.replace(" ", "").replace(",", ".")
+    try:
+        return float(s2)
+    except (ValueError, TypeError):
+        return np.nan
 
 
 def population_to_gradation(pop):
@@ -125,6 +160,26 @@ def gradation_to_category(grad):
     return GRAD_TO_CAT.get(str(grad).strip(), None)
 
 
+def clean_dataframe(df):
+    """
+    Приводит DataFrame к предсказуемым типам:
+      - Широта/Долгота → float
+      - Население → float
+      - Градация/Категория → оставляем как есть (могут быть текст/число)
+      - match_status → удаляем, если есть (чтобы не было дубля)
+    """
+    df = df.copy()
+    if "Широта" in df.columns:
+        df["Широта"] = df["Широта"].apply(to_float).astype(float)
+    if "Долгота" in df.columns:
+        df["Долгота"] = df["Долгота"].apply(to_float).astype(float)
+    if "Население" in df.columns:
+        df["Население"] = df["Население"].apply(to_float)
+    if "match_status" in df.columns:
+        df = df.drop(columns=["match_status"])
+    return df
+
+
 def remove_duplicates(user_df):
     """
     Удаляет дубликаты по (Город, Область), сохраняя исходный порядок:
@@ -152,6 +207,7 @@ def remove_duplicates(user_df):
     return result.reset_index(drop=True)
 
 
+# ==================== ГЕОМЕТРИЯ ====================
 def haversine_matrix(lat1, lon1, lat2, lon2):
     lat1 = np.radians(np.asarray(lat1, dtype=float))[:, None]
     lon1 = np.radians(np.asarray(lon1, dtype=float))[:, None]
@@ -170,36 +226,31 @@ def find_nearest(src_df, tgt_df):
     dists = np.full(n, np.nan)
     if len(tgt_df) == 0 or n == 0:
         return names, dists
+
+    # Защита: убираем строки без координат в target
+    tgt = tgt_df[
+        tgt_df["lat"].notna() & tgt_df["lon"].notna() &
+        (tgt_df["_name_orig"].astype(str).str.strip() != "")
+    ].copy()
+    if len(tgt) == 0:
+        return names, dists
+
     D = haversine_matrix(src_df["lat"].values, src_df["lon"].values,
-                         tgt_df["lat"].values, tgt_df["lon"].values)
+                         tgt["lat"].values, tgt["lon"].values)
     idx = D.argmin(axis=1)
-    names = tgt_df["_name_orig"].values[idx]
+    names = tgt["_name_orig"].values[idx]
     dists = D[np.arange(n), idx]
     return names, dists
 
 
+# ==================== МАТЧИНГ ====================
 def match_settlements(user_df, ds_df):
     """
-    Матчинг:
-      1. Словарь CITY_COORDS (приоритет)
-      2. Справочник по (settlement, region)
-    Обогащает Население/Градацию/Категорию из справочника, если пусто.
+    Матчинг координат:
+      0. Если Широта И Долгота заполнены → "из исходника"
+      1. Словарь CITY_COORDS
+      2. Справочник (settlement, region) + обогащение
     """
-    def to_float(v):
-        if v is None:
-            return np.nan
-        try:
-            if pd.isna(v):
-                return np.nan
-        except (TypeError, ValueError):
-            pass
-        if isinstance(v, (int, float, np.integer, np.floating)):
-            return float(v)
-        try:
-            return float(str(v).replace(",", ".").strip())
-        except (ValueError, TypeError):
-            return np.nan
-
     ds = ds_df.copy()
     ds["_s"] = ds["settlement"].apply(squeeze).str.lower()
     ds["_r"] = ds["region"].apply(squeeze).str.lower()
@@ -226,13 +277,21 @@ def match_settlements(user_df, ds_df):
             sett_map[key] = (lat, lon, pop)
 
     out = user_df.copy()
-    out["lat"] = np.nan
-    out["lon"] = np.nan
     out["match_status"] = ""
 
     for i, row in out.iterrows():
-        u_name = squeeze(row["Город"]).lower()
-        u_reg  = squeeze(row["Область"]).lower()
+        # --- 0. Координаты уже есть? ---
+        lat_in = to_float(row.get("Широта"))
+        lon_in = to_float(row.get("Долгота"))
+
+        coords_ok = not pd.isna(lat_in) and not pd.isna(lon_in)
+        if coords_ok:
+            out.at[i, "match_status"] = "из исходника"
+            continue
+
+        # --- Иначе — ищем ---
+        u_name = squeeze(row.get("Город", "")).lower()
+        u_reg  = squeeze(row.get("Область", "")).lower()
 
         if not u_name or not u_reg:
             out.at[i, "match_status"] = "пусто в исходнике"
@@ -241,8 +300,8 @@ def match_settlements(user_df, ds_df):
         # 1. Словарь
         if u_name in CITY_COORDS:
             lat, lon = CITY_COORDS[u_name]
-            out.at[i, "lat"] = lat
-            out.at[i, "lon"] = lon
+            out.at[i, "Широта"] = float(lat)
+            out.at[i, "Долгота"] = float(lon)
             out.at[i, "match_status"] = "из словаря"
             continue
 
@@ -250,14 +309,14 @@ def match_settlements(user_df, ds_df):
         key = (u_name, u_reg)
         if key in sett_map:
             lat, lon, pop = sett_map[key]
-            out.at[i, "lat"] = lat
-            out.at[i, "lon"] = lon
+            out.at[i, "Широта"] = float(lat)
+            out.at[i, "Долгота"] = float(lon)
             out.at[i, "match_status"] = "из справочника"
 
             # Обогащение: Население
             cur_pop = out.at[i, "Население"]
             if is_empty(cur_pop) and not pd.isna(pop):
-                out.at[i, "Население"] = pop
+                out.at[i, "Население"] = float(pop)
 
             # Обогащение: Градация
             cur_grad = out.at[i, "Градация"]
@@ -298,7 +357,7 @@ st.title("Расчёт ближайших населённых пунктов")
 
 st.markdown("### 1. Загрузите список НП")
 user_file = st.file_uploader(
-    "Ваш Excel/CSV (колонки: Тип НП, Город, Население, Градация, Категория, Область, ФО, СВЗ регион)",
+    "Ваш Excel/CSV (колонки: Тип НП, Город, Широта, Долгота, Население, Градация, Категория, Область, ФО, СВЗ регион)",
     type=["xlsx", "xls", "csv"],
     key="user_file"
 )
@@ -311,7 +370,7 @@ ds_file = st.file_uploader(
 )
 
 if user_file and ds_file:
-    user_df_raw = read_any(user_file)
+    user_df_raw = clean_dataframe(read_any(user_file))
     ds_df = read_any(ds_file)
 
     st.subheader("Ваш список")
@@ -322,7 +381,8 @@ if user_file and ds_file:
     st.dataframe(ds_df.head(5), use_container_width=True)
     st.caption(f"Строк: {len(ds_df)}")
 
-    required_user = ["Тип НП", "Город", "Население", "Градация", "Категория", "Область", "ФО", "СВЗ регион"]
+    required_user = ["Тип НП", "Город", "Широта", "Долгота", "Население",
+                     "Градация", "Категория", "Область", "ФО", "СВЗ регион"]
     required_ds = ["settlement", "region", "latitude_dd", "longitude_dd"]
 
     missing_user = [c for c in required_user if c not in user_df_raw.columns]
@@ -334,7 +394,6 @@ if user_file and ds_file:
         st.error(f"В справочнике нет колонок: {missing_ds}")
 
     if not missing_user and not missing_ds:
-        # Удаление дубликатов (тихо)
         user_df = remove_duplicates(user_df_raw)
 
         if st.button("1️⃣ Сопоставить"):
@@ -350,18 +409,19 @@ if user_file and ds_file:
             st.write("**Статусы:**")
             st.dataframe(stats, use_container_width=True)
 
-            # Предпросмотр "не найдено" — по новому правилу
             matched_cat_filled = ~matched["Категория"].apply(is_empty)
             nf_preview = matched[
                 ~(
-                    matched["match_status"].isin(["из словаря", "из справочника"]) &
+                    matched["match_status"].isin(["из исходника", "из словаря", "из справочника"]) &
                     matched_cat_filled
                 )
             ]
             if len(nf_preview):
                 st.warning(f"Не в «Результат»: {len(nf_preview)} НП")
-                st.dataframe(nf_preview[["Город", "Область", "match_status", "Категория"]].head(50),
-                             use_container_width=True)
+                st.dataframe(
+                    nf_preview[["Город", "Область", "match_status", "Категория"]].head(50),
+                    use_container_width=True
+                )
 
             st.subheader("Предпросмотр")
             st.dataframe(matched.head(20), use_container_width=True)
@@ -371,8 +431,11 @@ if user_file and ds_file:
                 work = st.session_state["matched"].copy()
                 user_df = st.session_state["user_df"]
 
-                work["_name_orig"] = work["Город"].astype(str)
+                work["_name_orig"] = work["Город"].astype(str).str.strip()
                 work["_cat"] = pd.to_numeric(work["Категория"], errors="coerce")
+
+                work["lat"] = work["Широта"].apply(to_float)
+                work["lon"] = work["Долгота"].apply(to_float)
                 has_coords = work["lat"].notna() & work["lon"].notna()
 
                 def sub(cats):
@@ -403,21 +466,20 @@ if user_file and ds_file:
                     work.loc[g6.index, NEW_COLS[4]] = names
                     work.loc[g6.index, NEW_COLS[5]] = np.round(dists, 2)
 
-                # Правило для "Результата": найден + категория заполнена
+                # Правило для "Результата"
                 cat_filled = ~work["Категория"].apply(is_empty)
                 in_result = (
-                    work["match_status"].isin(["из словаря", "из справочника"]) &
+                    work["match_status"].isin(["из исходника", "из словаря", "из справочника"]) &
                     cat_filled
                 )
 
                 sheet_res = work[in_result].copy()
                 orig_cols = [c for c in user_df.columns if c in sheet_res.columns]
-                sheet_res = sheet_res[orig_cols + ["lat", "lon", "match_status"] + NEW_COLS]
+                sheet_res = sheet_res[orig_cols + ["match_status"] + NEW_COLS]
 
-                # Всё остальное — в "Не_найдено"
                 sheet_nf = work[~in_result].copy()
                 nf_cols = [c for c in user_df.columns if c in sheet_nf.columns]
-                sheet_nf = sheet_nf[nf_cols]
+                sheet_nf = sheet_nf[nf_cols + ["match_status"]]
 
                 buf = io.BytesIO()
                 with pd.ExcelWriter(buf, engine="openpyxl") as writer:
