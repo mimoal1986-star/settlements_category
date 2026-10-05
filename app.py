@@ -28,6 +28,7 @@ GRAD_TO_CAT = {
 
 # ==================== СЛОВАРЬ КРУПНЫХ ГОРОДОВ ====================
 CITY_COORDS = {
+    # ... (47 городов из предыдущей версии)
     "москва": (55.7558, 37.6173),
     "санкт-петербург": (59.9343, 30.3351),
     "уфа": (54.7388, 55.9721),
@@ -88,7 +89,7 @@ def squeeze(s):
 
 
 def is_empty(v):
-    """True, если значение пустое (None, NaN, NaT, datetime, пустая строка, ' - ')."""
+    """True, если значение пустое (None, NaN, NaT, пустая строка, ' - ')."""
     if v is None:
         return True
     try:
@@ -97,21 +98,15 @@ def is_empty(v):
     except (TypeError, ValueError):
         pass
     if isinstance(v, (datetime, date)):
-        return False  # дата — не пусто, но бесполезна для координат
+        return False
     s = str(v).strip()
-    if s == "" or s == "-" or s == "—":
-        return True
-    return False
+    return s == "" or s == "-" or s == "—"
 
 
 def to_float(v):
-    """
-    Приводит значение к float или NaN.
-    Явно отсекает datetime, NaT, мусор.
-    """
+    """Приводит значение к float или NaN. Явно отсекает datetime."""
     if v is None:
         return np.nan
-    # datetime → NaN (Excel испортил координаты)
     if isinstance(v, (datetime, date)):
         return np.nan
     try:
@@ -124,7 +119,6 @@ def to_float(v):
     s = str(v).strip()
     if s == "" or s == "-" or s == "—":
         return np.nan
-    # Убираем пробелы-разделители тысяч, заменяем запятую на точку
     s2 = s.replace(" ", "").replace(",", ".")
     try:
         return float(s2)
@@ -161,13 +155,7 @@ def gradation_to_category(grad):
 
 
 def clean_dataframe(df):
-    """
-    Приводит DataFrame к предсказуемым типам:
-      - Широта/Долгота → float
-      - Население → float
-      - Градация/Категория → оставляем как есть (могут быть текст/число)
-      - match_status → удаляем, если есть (чтобы не было дубля)
-    """
+    """Приводит типы и удаляет match_status, если есть."""
     df = df.copy()
     if "Широта" in df.columns:
         df["Широта"] = df["Широта"].apply(to_float).astype(float)
@@ -182,7 +170,7 @@ def clean_dataframe(df):
 
 def remove_duplicates(user_df):
     """
-    Удаляет дубликаты по (Город, Область), сохраняя исходный порядок:
+    Первичное удаление дубликатов по (Город, Область):
       - все дубликаты с пустой Категорией → 1 строка
       - часть пустых, часть заполненных → удаляем только пустые
       - несколько заполненных → оставляем все
@@ -207,6 +195,43 @@ def remove_duplicates(user_df):
     return result.reset_index(drop=True)
 
 
+def count_filled(row):
+    """Считает заполненные колонки из заданного набора."""
+    cols = ["Город", "Широта", "Долгота", "Население",
+            "Градация", "Категория", "Область"]
+    return sum(1 for c in cols if c in row.index and not is_empty(row[c]))
+
+
+def final_dedup(df):
+    """
+    Финальное удаление дубликатов по (Город, Область).
+    Оставляем строку с максимальным числом заполненных колонок.
+    При равенстве — первую по исходному порядку.
+    """
+    if len(df) == 0:
+        return df
+
+    df = df.copy()
+    df["_filled"] = df.apply(count_filled, axis=1)
+    df["_key"] = df.apply(
+        lambda r: (squeeze(r["Город"]).lower(), squeeze(r["Область"]).lower()),
+        axis=1
+    )
+    df["_orig_order"] = range(len(df))
+
+    df_sorted = df.sort_values(
+        ["_filled", "_orig_order"],
+        ascending=[False, True],
+        kind="stable"
+    )
+
+    idx_to_keep = df_sorted.groupby("_key", sort=False).head(1).index
+    result = df.loc[sorted(idx_to_keep)].drop(
+        columns=["_filled", "_key", "_orig_order"]
+    )
+    return result.reset_index(drop=True)
+
+
 # ==================== ГЕОМЕТРИЯ ====================
 def haversine_matrix(lat1, lon1, lat2, lon2):
     lat1 = np.radians(np.asarray(lat1, dtype=float))[:, None]
@@ -227,7 +252,6 @@ def find_nearest(src_df, tgt_df):
     if len(tgt_df) == 0 or n == 0:
         return names, dists
 
-    # Защита: убираем строки без координат в target
     tgt = tgt_df[
         tgt_df["lat"].notna() & tgt_df["lon"].notna() &
         (tgt_df["_name_orig"].astype(str).str.strip() != "")
@@ -280,7 +304,6 @@ def match_settlements(user_df, ds_df):
     out["match_status"] = ""
 
     for i, row in out.iterrows():
-        # --- 0. Координаты уже есть? ---
         lat_in = to_float(row.get("Широта"))
         lon_in = to_float(row.get("Долгота"))
 
@@ -289,7 +312,6 @@ def match_settlements(user_df, ds_df):
             out.at[i, "match_status"] = "из исходника"
             continue
 
-        # --- Иначе — ищем ---
         u_name = squeeze(row.get("Город", "")).lower()
         u_reg  = squeeze(row.get("Область", "")).lower()
 
@@ -297,7 +319,6 @@ def match_settlements(user_df, ds_df):
             out.at[i, "match_status"] = "пусто в исходнике"
             continue
 
-        # 1. Словарь
         if u_name in CITY_COORDS:
             lat, lon = CITY_COORDS[u_name]
             out.at[i, "Широта"] = float(lat)
@@ -305,7 +326,6 @@ def match_settlements(user_df, ds_df):
             out.at[i, "match_status"] = "из словаря"
             continue
 
-        # 2. Справочник
         key = (u_name, u_reg)
         if key in sett_map:
             lat, lon, pop = sett_map[key]
@@ -313,22 +333,16 @@ def match_settlements(user_df, ds_df):
             out.at[i, "Долгота"] = float(lon)
             out.at[i, "match_status"] = "из справочника"
 
-            # Обогащение: Население
-            cur_pop = out.at[i, "Население"]
-            if is_empty(cur_pop) and not pd.isna(pop):
+            if is_empty(out.at[i, "Население"]) and not pd.isna(pop):
                 out.at[i, "Население"] = float(pop)
 
-            # Обогащение: Градация
-            cur_grad = out.at[i, "Градация"]
-            if is_empty(cur_grad):
+            if is_empty(out.at[i, "Градация"]):
                 pop_use = out.at[i, "Население"]
                 grad = population_to_gradation(pop_use)
                 if grad is not None:
                     out.at[i, "Градация"] = grad
 
-            # Обогащение: Категория
-            cur_cat = out.at[i, "Категория"]
-            if is_empty(cur_cat):
+            if is_empty(out.at[i, "Категория"]):
                 grad_use = out.at[i, "Градация"]
                 cat = gradation_to_category(grad_use)
                 if cat is not None:
@@ -466,13 +480,13 @@ if user_file and ds_file:
                     work.loc[g6.index, NEW_COLS[4]] = names
                     work.loc[g6.index, NEW_COLS[5]] = np.round(dists, 2)
 
-                # Правило для "Результата"
                 cat_filled = ~work["Категория"].apply(is_empty)
                 in_result = (
                     work["match_status"].isin(["из исходника", "из словаря", "из справочника"]) &
                     cat_filled
                 )
 
+                # === ФОРМИРОВАНИЕ ЛИСТОВ ===
                 sheet_res = work[in_result].copy()
                 orig_cols = [c for c in user_df.columns if c in sheet_res.columns]
                 sheet_res = sheet_res[orig_cols + ["match_status"] + NEW_COLS]
@@ -481,6 +495,10 @@ if user_file and ds_file:
                 nf_cols = [c for c in user_df.columns if c in sheet_nf.columns]
                 sheet_nf = sheet_nf[nf_cols + ["match_status"]]
 
+                # === ФИНАЛЬНОЕ УДАЛЕНИЕ ДУБЛИКАТОВ (перед выгрузкой) ===
+                sheet_res = final_dedup(sheet_res)
+
+                # === ВЫГРУЗКА ===
                 buf = io.BytesIO()
                 with pd.ExcelWriter(buf, engine="openpyxl") as writer:
                     sheet_res.to_excel(writer, sheet_name="Результат", index=False)
