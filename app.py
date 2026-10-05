@@ -86,18 +86,19 @@ def squeeze(s):
 
 
 def is_empty(v):
-    """True, если значение пустое (None, NaN или пустая строка)."""
+    """True, если значение пустое (None, NaN, NaT или пустая строка)."""
     if v is None:
         return True
-    if isinstance(v, float) and pd.isna(v):
-        return True
-    if pd.isna(v):
-        return True
+    try:
+        if pd.isna(v):
+            return True
+    except (TypeError, ValueError):
+        pass
     return str(v).strip() == ""
 
 
 def population_to_gradation(pop):
-    if pd.isna(pop):
+    if pop is None or pd.isna(pop):
         return None
     try:
         pop = float(pop)
@@ -119,7 +120,7 @@ def population_to_gradation(pop):
 
 
 def gradation_to_category(grad):
-    if pd.isna(grad):
+    if grad is None or pd.isna(grad):
         return None
     return GRAD_TO_CAT.get(str(grad).strip(), None)
 
@@ -134,15 +135,12 @@ def remove_duplicates(user_df):
     df = user_df.copy()
     df["_cat_filled"] = df["Категория"].apply(lambda v: not is_empty(v))
 
-    # Собираем keep в порядке появления
-    keep_set = set()
-    # Проходим в исходном порядке: для каждой группы запоминаем первую "хорошую"
-    # или первую вообще
     groups_seen = {}
     for idx, row in df.iterrows():
         key = (squeeze(row["Город"]).lower(), squeeze(row["Область"]).lower())
         groups_seen.setdefault(key, []).append(idx)
 
+    keep_set = set()
     for key, indices in groups_seen.items():
         filled = [i for i in indices if df.at[i, "_cat_filled"]]
         if filled:
@@ -188,7 +186,7 @@ def match_settlements(user_df, ds_df):
     Обогащает Население/Градацию/Категорию из справочника, если пусто.
     """
     def to_float(v):
-        if v is None or (isinstance(v, float) and pd.isna(v)):
+        if v is None:
             return np.nan
         try:
             if pd.isna(v):
@@ -208,13 +206,11 @@ def match_settlements(user_df, ds_df):
     ds["_lat"] = [to_float(v) for v in ds["latitude_dd"].values]
     ds["_lon"] = [to_float(v) for v in ds["longitude_dd"].values]
 
-    # population может отсутствовать
     if "population" in ds.columns:
         ds["_pop"] = [to_float(v) for v in ds["population"].values]
     else:
         ds["_pop"] = [np.nan] * len(ds)
 
-    # Словарь (settlement, region) → (lat, lon, pop)
     sett_map = {}
     for s, r, lat, lon, pop in zip(
         ds["_s"].values, ds["_r"].values,
@@ -258,12 +254,12 @@ def match_settlements(user_df, ds_df):
             out.at[i, "lon"] = lon
             out.at[i, "match_status"] = "из справочника"
 
-            # --- Обогащение: Население ---
+            # Обогащение: Население
             cur_pop = out.at[i, "Население"]
             if is_empty(cur_pop) and not pd.isna(pop):
                 out.at[i, "Население"] = pop
 
-            # --- Обогащение: Градация ---
+            # Обогащение: Градация
             cur_grad = out.at[i, "Градация"]
             if is_empty(cur_grad):
                 pop_use = out.at[i, "Население"]
@@ -271,7 +267,7 @@ def match_settlements(user_df, ds_df):
                 if grad is not None:
                     out.at[i, "Градация"] = grad
 
-            # --- Обогащение: Категория ---
+            # Обогащение: Категория
             cur_cat = out.at[i, "Категория"]
             if is_empty(cur_cat):
                 grad_use = out.at[i, "Градация"]
@@ -354,10 +350,17 @@ if user_file and ds_file:
             st.write("**Статусы:**")
             st.dataframe(stats, use_container_width=True)
 
-            nf = matched[matched["match_status"].isin(["не найдено", "пусто в исходнике"])]
-            if len(nf):
-                st.warning(f"Не найдено / пусто: {len(nf)} НП")
-                st.dataframe(nf[["Город", "Область"]].head(50),
+            # Предпросмотр "не найдено" — по новому правилу
+            matched_cat_filled = ~matched["Категория"].apply(is_empty)
+            nf_preview = matched[
+                ~(
+                    matched["match_status"].isin(["из словаря", "из справочника"]) &
+                    matched_cat_filled
+                )
+            ]
+            if len(nf_preview):
+                st.warning(f"Не в «Результат»: {len(nf_preview)} НП")
+                st.dataframe(nf_preview[["Город", "Область", "match_status", "Категория"]].head(50),
                              use_container_width=True)
 
             st.subheader("Предпросмотр")
@@ -400,18 +403,19 @@ if user_file and ds_file:
                     work.loc[g6.index, NEW_COLS[4]] = names
                     work.loc[g6.index, NEW_COLS[5]] = np.round(dists, 2)
 
-                # Лист «Результат» — только найденные
-                sheet_res = work[
-                    work["match_status"].isin(["из словаря", "из справочника"])
-                ].copy()
+                # Правило для "Результата": найден + категория заполнена
+                cat_filled = ~work["Категория"].apply(is_empty)
+                in_result = (
+                    work["match_status"].isin(["из словаря", "из справочника"]) &
+                    cat_filled
+                )
 
+                sheet_res = work[in_result].copy()
                 orig_cols = [c for c in user_df.columns if c in sheet_res.columns]
                 sheet_res = sheet_res[orig_cols + ["lat", "lon", "match_status"] + NEW_COLS]
 
-                # Лист «Не_найдено»
-                sheet_nf = work[
-                    work["match_status"].isin(["не найдено", "пусто в исходнике"])
-                ].copy()
+                # Всё остальное — в "Не_найдено"
+                sheet_nf = work[~in_result].copy()
                 nf_cols = [c for c in user_df.columns if c in sheet_nf.columns]
                 sheet_nf = sheet_nf[nf_cols]
 
