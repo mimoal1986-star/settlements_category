@@ -16,6 +16,8 @@ NEW_COLS = [
     "Для НП 6 → НП 5 расстояние",
 ]
 
+FINAL_COLS = ["Город new", "Категория new"]
+
 GRAD_TO_CAT = {
     "миллионник": 1,
     "от 500 тыс. до 1 млн. человек": 1,
@@ -28,7 +30,6 @@ GRAD_TO_CAT = {
 
 # ==================== СЛОВАРЬ КРУПНЫХ ГОРОДОВ ====================
 CITY_COORDS = {
-    # ... (47 городов из предыдущей версии)
     "москва": (55.7558, 37.6173),
     "санкт-петербург": (59.9343, 30.3351),
     "уфа": (54.7388, 55.9721),
@@ -89,7 +90,6 @@ def squeeze(s):
 
 
 def is_empty(v):
-    """True, если значение пустое (None, NaN, NaT, пустая строка, ' - ')."""
     if v is None:
         return True
     try:
@@ -104,7 +104,6 @@ def is_empty(v):
 
 
 def to_float(v):
-    """Приводит значение к float или NaN. Явно отсекает datetime."""
     if v is None:
         return np.nan
     if isinstance(v, (datetime, date)):
@@ -155,7 +154,6 @@ def gradation_to_category(grad):
 
 
 def clean_dataframe(df):
-    """Приводит типы и удаляет match_status, если есть."""
     df = df.copy()
     if "Широта" in df.columns:
         df["Широта"] = df["Широта"].apply(to_float).astype(float)
@@ -169,12 +167,6 @@ def clean_dataframe(df):
 
 
 def remove_duplicates(user_df):
-    """
-    Первичное удаление дубликатов по (Город, Область):
-      - все дубликаты с пустой Категорией → 1 строка
-      - часть пустых, часть заполненных → удаляем только пустые
-      - несколько заполненных → оставляем все
-    """
     df = user_df.copy()
     df["_cat_filled"] = df["Категория"].apply(lambda v: not is_empty(v))
 
@@ -196,18 +188,12 @@ def remove_duplicates(user_df):
 
 
 def count_filled(row):
-    """Считает заполненные колонки из заданного набора."""
     cols = ["Город", "Широта", "Долгота", "Население",
             "Градация", "Категория", "Область"]
     return sum(1 for c in cols if c in row.index and not is_empty(row[c]))
 
 
 def final_dedup(df):
-    """
-    Финальное удаление дубликатов по (Город, Область).
-    Оставляем строку с максимальным числом заполненных колонок.
-    При равенстве — первую по исходному порядку.
-    """
     if len(df) == 0:
         return df
 
@@ -230,6 +216,66 @@ def final_dedup(df):
         columns=["_filled", "_key", "_orig_order"]
     )
     return result.reset_index(drop=True)
+
+
+# ==================== ГОРОД NEW / КАТЕГОРИЯ NEW ====================
+def compute_city_new(sheet_res):
+    """
+    Добавляет 'Город new' и 'Категория new' по логике Excel:
+      Город new = K, если L < 31
+                = M, если N < 21
+                = O, если P < 11
+                = B (исходный город), иначе
+      Категория new = категория НП с именем 'Город new' (VLOOKUP).
+    Работает только для листа «Результат».
+    """
+    sheet_res = sheet_res.copy()
+    sheet_res["Город new"] = None
+    sheet_res["Категория new"] = None
+
+    # Словарь: нормализованное имя → категория
+    city_to_cat = {}
+    for _, row in sheet_res.iterrows():
+        city = squeeze(row["Город"])
+        cat = row["Категория"]
+        if city and not is_empty(cat):
+            city_to_cat.setdefault(city.lower(), cat)
+
+    for i, row in sheet_res.iterrows():
+        K = row.get(NEW_COLS[0])
+        L = row.get(NEW_COLS[1])
+        M = row.get(NEW_COLS[2])
+        N = row.get(NEW_COLS[3])
+        O = row.get(NEW_COLS[4])
+        P = row.get(NEW_COLS[5])
+        B = squeeze(row["Город"])
+
+        L_f = to_float(L)
+        N_f = to_float(N)
+        P_f = to_float(P)
+
+        result = None
+        if not pd.isna(L_f) and L_f < 31:
+            result = K
+        elif not pd.isna(N_f) and N_f < 21:
+            result = M
+        elif not pd.isna(P_f) and P_f < 11:
+            result = O
+        else:
+            result = B
+
+        if is_empty(result) or result == 0:
+            result = B
+
+        sheet_res.at[i, "Город new"] = result
+
+        cat_new = city_to_cat.get(squeeze(result).lower())
+        if not is_empty(cat_new):
+            sheet_res.at[i, "Категория new"] = cat_new
+        else:
+            sheet_res.at[i, "Категория new"] = row["Категория"]
+
+    return sheet_res
 
 
 # ==================== ГЕОМЕТРИЯ ====================
@@ -269,12 +315,6 @@ def find_nearest(src_df, tgt_df):
 
 # ==================== МАТЧИНГ ====================
 def match_settlements(user_df, ds_df):
-    """
-    Матчинг координат:
-      0. Если Широта И Долгота заполнены → "из исходника"
-      1. Словарь CITY_COORDS
-      2. Справочник (settlement, region) + обогащение
-    """
     ds = ds_df.copy()
     ds["_s"] = ds["settlement"].apply(squeeze).str.lower()
     ds["_r"] = ds["region"].apply(squeeze).str.lower()
@@ -480,23 +520,38 @@ if user_file and ds_file:
                     work.loc[g6.index, NEW_COLS[4]] = names
                     work.loc[g6.index, NEW_COLS[5]] = np.round(dists, 2)
 
+                # Правило для "Результата"
                 cat_filled = ~work["Категория"].apply(is_empty)
                 in_result = (
                     work["match_status"].isin(["из исходника", "из словаря", "из справочника"]) &
                     cat_filled
                 )
 
-                # === ФОРМИРОВАНИЕ ЛИСТОВ ===
+                # === ЛИСТ «РЕЗУЛЬТАТ» ===
                 sheet_res = work[in_result].copy()
                 orig_cols = [c for c in user_df.columns if c in sheet_res.columns]
                 sheet_res = sheet_res[orig_cols + ["match_status"] + NEW_COLS]
 
+                # 1. Сначала — удаляем дубликаты
+                sheet_res = final_dedup(sheet_res)
+
+                # 2. Потом — считаем Город new / Категория new
+                sheet_res = compute_city_new(sheet_res)
+
+                # Категория new → число
+                sheet_res["Категория new"] = pd.to_numeric(
+                    sheet_res["Категория new"], errors="coerce"
+                )
+
+                # Финальный порядок колонок
+                sheet_res = sheet_res[
+                    orig_cols + ["match_status"] + NEW_COLS + FINAL_COLS
+                ]
+
+                # === ЛИСТ «НЕ_НАЙДЕНО» ===
                 sheet_nf = work[~in_result].copy()
                 nf_cols = [c for c in user_df.columns if c in sheet_nf.columns]
                 sheet_nf = sheet_nf[nf_cols + ["match_status"]]
-
-                # === ФИНАЛЬНОЕ УДАЛЕНИЕ ДУБЛИКАТОВ (перед выгрузкой) ===
-                sheet_res = final_dedup(sheet_res)
 
                 # === ВЫГРУЗКА ===
                 buf = io.BytesIO()
