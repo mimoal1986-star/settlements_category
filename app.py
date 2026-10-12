@@ -9,14 +9,17 @@ R_EARTH = 6371.0
 
 NEW_COLS = [
     "Для НП 3-6 → НП 1, 2 Имя НП",
+    "Для НП 3-6 → НП 1, 2 Область",
     "Для НП 3-6 → НП 1, 2 расстояние",
     "Для НП 5-6 → НП 3, 4 Имя НП",
+    "Для НП 5-6 → НП 3, 4 Область",
     "Для НП 5-6 → НП 3, 4 расстояние",
     "Для НП 6 → НП 5 Имя НП",
+    "Для НП 6 → НП 5 Область",
     "Для НП 6 → НП 5 расстояние",
 ]
 
-FINAL_COLS = ["Город new", "Категория new"]
+FINAL_COLS = ["Город new", "Область new", "Категория new"]
 
 GRAD_TO_CAT = {
     "миллионник": 1,
@@ -218,62 +221,84 @@ def final_dedup(df):
     return result.reset_index(drop=True)
 
 
-# ==================== ГОРОД NEW / КАТЕГОРИЯ NEW ====================
+# ==================== ГОРОД NEW / ОБЛАСТЬ NEW / КАТЕГОРИЯ NEW ====================
 def compute_city_new(sheet_res):
     """
-    Добавляет 'Город new' и 'Категория new' по логике Excel:
-      Город new = K, если L < 31
-                = M, если N < 21
-                = O, если P < 11
-                = B (исходный город), иначе
-      Категория new = категория НП с именем 'Город new' (VLOOKUP).
-    Работает только для листа «Результат».
+    Город new / Область new / Категория new:
+      - если сработал порог (L<31 / N<21 / P<11) → имя и область ближайшего
+        (из соответствующих колонок этой строки), категория — по ключу
+        (Город new, Область new) из словаря
+      - иначе → Город / Область / Категория ИЗ ЭТОЙ ЖЕ СТРОКИ
     """
     sheet_res = sheet_res.copy()
     sheet_res["Город new"] = None
+    sheet_res["Область new"] = None
     sheet_res["Категория new"] = None
 
-    # Словарь: нормализованное имя → категория
+    # Уникальный словарь: (Город, Область) → Категория
     city_to_cat = {}
     for _, row in sheet_res.iterrows():
         city = squeeze(row["Город"])
-        cat = row["Категория"]
-        if city and not is_empty(cat):
-            city_to_cat.setdefault(city.lower(), cat)
+        reg  = squeeze(row["Область"])
+        cat  = row["Категория"]
+        if city and reg and not is_empty(cat):
+            key = (city.lower(), reg.lower())
+            if key not in city_to_cat:
+                city_to_cat[key] = cat
 
     for i, row in sheet_res.iterrows():
-        K = row.get(NEW_COLS[0])
-        L = row.get(NEW_COLS[1])
-        M = row.get(NEW_COLS[2])
-        N = row.get(NEW_COLS[3])
-        O = row.get(NEW_COLS[4])
-        P = row.get(NEW_COLS[5])
+        K = row.get("Для НП 3-6 → НП 1, 2 Имя НП")
+        L = row.get("Для НП 3-6 → НП 1, 2 расстояние")
+        K_reg = row.get("Для НП 3-6 → НП 1, 2 Область")
+
+        M = row.get("Для НП 5-6 → НП 3, 4 Имя НП")
+        N = row.get("Для НП 5-6 → НП 3, 4 расстояние")
+        M_reg = row.get("Для НП 5-6 → НП 3, 4 Область")
+
+        O = row.get("Для НП 6 → НП 5 Имя НП")
+        P = row.get("Для НП 6 → НП 5 расстояние")
+        O_reg = row.get("Для НП 6 → НП 5 Область")
+
         B = squeeze(row["Город"])
+        B_reg = squeeze(row["Область"])
+        B_cat = row["Категория"]
 
         L_f = to_float(L)
         N_f = to_float(N)
         P_f = to_float(P)
 
-        result = None
+        matched_name = None
+        matched_reg = None
+
         if not pd.isna(L_f) and L_f < 31:
-            result = K
+            matched_name = K
+            matched_reg = K_reg
         elif not pd.isna(N_f) and N_f < 21:
-            result = M
+            matched_name = M
+            matched_reg = M_reg
         elif not pd.isna(P_f) and P_f < 11:
-            result = O
+            matched_name = O
+            matched_reg = O_reg
+
+        if matched_name is not None and not is_empty(matched_name):
+            sheet_res.at[i, "Город new"] = matched_name
+            sheet_res.at[i, "Область new"] = matched_reg
+
+            if not is_empty(matched_reg):
+                cat_new = city_to_cat.get(
+                    (squeeze(matched_name).lower(), squeeze(matched_reg).lower())
+                )
+            else:
+                cat_new = None
+
+            if not is_empty(cat_new):
+                sheet_res.at[i, "Категория new"] = cat_new
+            else:
+                sheet_res.at[i, "Категория new"] = B_cat
         else:
-            result = B
-
-        if is_empty(result) or result == 0:
-            result = B
-
-        sheet_res.at[i, "Город new"] = result
-
-        cat_new = city_to_cat.get(squeeze(result).lower())
-        if not is_empty(cat_new):
-            sheet_res.at[i, "Категория new"] = cat_new
-        else:
-            sheet_res.at[i, "Категория new"] = row["Категория"]
+            sheet_res.at[i, "Город new"] = B
+            sheet_res.at[i, "Область new"] = B_reg
+            sheet_res.at[i, "Категория new"] = B_cat
 
     return sheet_res
 
@@ -292,25 +317,34 @@ def haversine_matrix(lat1, lon1, lat2, lon2):
 
 
 def find_nearest(src_df, tgt_df):
+    """
+    Возвращает (names, regions, dists).
+    Фильтрует target по наличию координат, имени и области.
+    """
     n = len(src_df)
     names = np.array([None] * n, dtype=object)
+    regions = np.array([None] * n, dtype=object)
     dists = np.full(n, np.nan)
+
     if len(tgt_df) == 0 or n == 0:
-        return names, dists
+        return names, regions, dists
 
     tgt = tgt_df[
         tgt_df["lat"].notna() & tgt_df["lon"].notna() &
-        (tgt_df["_name_orig"].astype(str).str.strip() != "")
+        (tgt_df["_name_orig"].astype(str).str.strip() != "") &
+        (tgt_df["_region_orig"].astype(str).str.strip() != "")
     ].copy()
+
     if len(tgt) == 0:
-        return names, dists
+        return names, regions, dists
 
     D = haversine_matrix(src_df["lat"].values, src_df["lon"].values,
                          tgt["lat"].values, tgt["lon"].values)
     idx = D.argmin(axis=1)
     names = tgt["_name_orig"].values[idx]
+    regions = tgt["_region_orig"].values[idx]
     dists = D[np.arange(n), idx]
-    return names, dists
+    return names, regions, dists
 
 
 # ==================== МАТЧИНГ ====================
@@ -486,6 +520,7 @@ if user_file and ds_file:
                 user_df = st.session_state["user_df"]
 
                 work["_name_orig"] = work["Город"].astype(str).str.strip()
+                work["_region_orig"] = work["Область"].astype(str).str.strip()
                 work["_cat"] = pd.to_numeric(work["Категория"], errors="coerce")
 
                 work["lat"] = work["Широта"].apply(to_float)
@@ -505,22 +540,27 @@ if user_file and ds_file:
                 for c in NEW_COLS:
                     work[c] = None
 
+                # Правило 1: 3-6 → 1,2
                 if len(g3456) and len(g12):
-                    names, dists = find_nearest(g3456, g12)
-                    work.loc[g3456.index, NEW_COLS[0]] = names
-                    work.loc[g3456.index, NEW_COLS[1]] = np.round(dists, 2)
+                    names, regions, dists = find_nearest(g3456, g12)
+                    work.loc[g3456.index, "Для НП 3-6 → НП 1, 2 Имя НП"] = names
+                    work.loc[g3456.index, "Для НП 3-6 → НП 1, 2 Область"] = regions
+                    work.loc[g3456.index, "Для НП 3-6 → НП 1, 2 расстояние"] = np.round(dists, 2)
 
+                # Правило 2: 5-6 → 3,4
                 if len(g56) and len(g34):
-                    names, dists = find_nearest(g56, g34)
-                    work.loc[g56.index, NEW_COLS[2]] = names
-                    work.loc[g56.index, NEW_COLS[3]] = np.round(dists, 2)
+                    names, regions, dists = find_nearest(g56, g34)
+                    work.loc[g56.index, "Для НП 5-6 → НП 3, 4 Имя НП"] = names
+                    work.loc[g56.index, "Для НП 5-6 → НП 3, 4 Область"] = regions
+                    work.loc[g56.index, "Для НП 5-6 → НП 3, 4 расстояние"] = np.round(dists, 2)
 
+                # Правило 3: 6 → 5
                 if len(g6) and len(g5):
-                    names, dists = find_nearest(g6, g5)
-                    work.loc[g6.index, NEW_COLS[4]] = names
-                    work.loc[g6.index, NEW_COLS[5]] = np.round(dists, 2)
+                    names, regions, dists = find_nearest(g6, g5)
+                    work.loc[g6.index, "Для НП 6 → НП 5 Имя НП"] = names
+                    work.loc[g6.index, "Для НП 6 → НП 5 Область"] = regions
+                    work.loc[g6.index, "Для НП 6 → НП 5 расстояние"] = np.round(dists, 2)
 
-                # Правило для "Результата"
                 cat_filled = ~work["Категория"].apply(is_empty)
                 in_result = (
                     work["match_status"].isin(["из исходника", "из словаря", "из справочника"]) &
@@ -532,18 +572,12 @@ if user_file and ds_file:
                 orig_cols = [c for c in user_df.columns if c in sheet_res.columns]
                 sheet_res = sheet_res[orig_cols + ["match_status"] + NEW_COLS]
 
-                # 1. Сначала — удаляем дубликаты
                 sheet_res = final_dedup(sheet_res)
-
-                # 2. Потом — считаем Город new / Категория new
                 sheet_res = compute_city_new(sheet_res)
-
-                # Категория new → число
                 sheet_res["Категория new"] = pd.to_numeric(
                     sheet_res["Категория new"], errors="coerce"
                 )
 
-                # Финальный порядок колонок
                 sheet_res = sheet_res[
                     orig_cols + ["match_status"] + NEW_COLS + FINAL_COLS
                 ]
