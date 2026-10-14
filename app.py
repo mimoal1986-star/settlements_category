@@ -3,9 +3,11 @@ import pandas as pd
 import numpy as np
 import re
 import io
+import os
 from datetime import datetime, date
 
 R_EARTH = 6371.0
+SPRAVOCHNIK_FILE = "spravochnik.csv"
 
 NEW_COLS = [
     "Для НП 3-6 → НП 1, 2 Имя НП",
@@ -98,7 +100,6 @@ def squeeze(s):
 
 
 def find_col(df, target):
-    """Ищет колонку по нормализованному имени (squeeze + lower). Берёт первую."""
     if target is None:
         return None
     target_norm = squeeze(target).lower()
@@ -237,7 +238,7 @@ def final_dedup(df):
     return result.reset_index(drop=True)
 
 
-# ==================== ГОРОД NEW / ОБЛАСТЬ NEW / КАТЕГОРИЯ NEW ====================
+# ==================== ГОРОД NEW ====================
 def compute_city_new(sheet_res):
     sheet_res = sheet_res.copy()
     sheet_res["Город new"] = None
@@ -258,11 +259,9 @@ def compute_city_new(sheet_res):
         K = row.get("Для НП 3-6 → НП 1, 2 Имя НП")
         L = row.get("Для НП 3-6 → НП 1, 2 расстояние")
         K_reg = row.get("Для НП 3-6 → НП 1, 2 Область")
-
         M = row.get("Для НП 5-6 → НП 3, 4 Имя НП")
         N = row.get("Для НП 5-6 → НП 3, 4 расстояние")
         M_reg = row.get("Для НП 5-6 → НП 3, 4 Область")
-
         O = row.get("Для НП 6 → НП 5 Имя НП")
         P = row.get("Для НП 6 → НП 5 расстояние")
         O_reg = row.get("Для НП 6 → НП 5 Область")
@@ -271,38 +270,28 @@ def compute_city_new(sheet_res):
         B_reg = squeeze(row["Область"])
         B_cat = row["Категория"]
 
-        L_f = to_float(L)
-        N_f = to_float(N)
-        P_f = to_float(P)
+        L_f = to_float(L); N_f = to_float(N); P_f = to_float(P)
 
         matched_name = None
         matched_reg = None
 
         if not pd.isna(L_f) and L_f < 31:
-            matched_name = K
-            matched_reg = K_reg
+            matched_name = K; matched_reg = K_reg
         elif not pd.isna(N_f) and N_f < 21:
-            matched_name = M
-            matched_reg = M_reg
+            matched_name = M; matched_reg = M_reg
         elif not pd.isna(P_f) and P_f < 11:
-            matched_name = O
-            matched_reg = O_reg
+            matched_name = O; matched_reg = O_reg
 
         if matched_name is not None and not is_empty(matched_name):
             sheet_res.at[i, "Город new"] = matched_name
             sheet_res.at[i, "Область new"] = matched_reg
-
             if not is_empty(matched_reg):
                 cat_new = city_to_cat.get(
                     (squeeze(matched_name).lower(), squeeze(matched_reg).lower())
                 )
             else:
                 cat_new = None
-
-            if not is_empty(cat_new):
-                sheet_res.at[i, "Категория new"] = cat_new
-            else:
-                sheet_res.at[i, "Категория new"] = B_cat
+            sheet_res.at[i, "Категория new"] = cat_new if not is_empty(cat_new) else B_cat
         else:
             sheet_res.at[i, "Город new"] = B
             sheet_res.at[i, "Область new"] = B_reg
@@ -320,7 +309,6 @@ def build_avp(sx_df, bdr_df, result_df):
         "no_expenses": pd.DataFrame(),
     }
 
-    # Ищем колонки в СХ
     sx_key_names = ["Client", "Project Name", "Wave Name", "Project Code", "Регион", "Город"]
     sx_cols = {}
     for name in sx_key_names + ["Region short"]:
@@ -335,7 +323,6 @@ def build_avp(sx_df, bdr_df, result_df):
         subset=sx_key_names + ["Region short"]
     ).reset_index(drop=True)
 
-    # Ищем колонки в result
     res_city = find_col(result_df, "Город")
     res_region = find_col(result_df, "СВЗ регион")
     if res_city is None or res_region is None:
@@ -380,7 +367,6 @@ def build_avp(sx_df, bdr_df, result_df):
         issues["no_category"] = no_cat[["Client", "Project Name", "Wave Name",
                                          "Project Code", "Город", "Region short"]]
 
-    # Ищем колонки в БДР
     bdr_code = find_col(bdr_df, "КОД")
     bdr_exp = find_col(bdr_df, "Расходы на ТП/Респонденты (план на 1 ед.)")
     if bdr_code is None or bdr_exp is None:
@@ -452,19 +438,15 @@ def find_nearest(src_df, tgt_df):
     names = np.array([None] * n, dtype=object)
     regions = np.array([None] * n, dtype=object)
     dists = np.full(n, np.nan)
-
     if len(tgt_df) == 0 or n == 0:
         return names, regions, dists
-
     tgt = tgt_df[
         tgt_df["lat"].notna() & tgt_df["lon"].notna() &
         (tgt_df["_name_orig"].astype(str).str.strip() != "") &
         (tgt_df["_region_orig"].astype(str).str.strip() != "")
     ].copy()
-
     if len(tgt) == 0:
         return names, regions, dists
-
     D = haversine_matrix(src_df["lat"].values, src_df["lon"].values,
                          tgt["lat"].values, tgt["lon"].values)
     idx = D.argmin(axis=1)
@@ -481,7 +463,6 @@ def match_settlements(user_df, ds_df):
     ds["_r"] = ds["region"].apply(squeeze).str.lower()
     ds["_lat"] = [to_float(v) for v in ds["latitude_dd"].values]
     ds["_lon"] = [to_float(v) for v in ds["longitude_dd"].values]
-
     if "population" in ds.columns:
         ds["_pop"] = [to_float(v) for v in ds["population"].values]
     else:
@@ -507,9 +488,7 @@ def match_settlements(user_df, ds_df):
     for i, row in out.iterrows():
         lat_in = to_float(row.get("Широта"))
         lon_in = to_float(row.get("Долгота"))
-
-        coords_ok = not pd.isna(lat_in) and not pd.isna(lon_in)
-        if coords_ok:
+        if not pd.isna(lat_in) and not pd.isna(lon_in):
             out.at[i, "match_status"] = "из исходника"
             continue
 
@@ -533,22 +512,16 @@ def match_settlements(user_df, ds_df):
             out.at[i, "Широта"] = float(lat)
             out.at[i, "Долгота"] = float(lon)
             out.at[i, "match_status"] = "из справочника"
-
             if is_empty(out.at[i, "Население"]) and not pd.isna(pop):
                 out.at[i, "Население"] = float(pop)
-
             if is_empty(out.at[i, "Градация"]):
-                pop_use = out.at[i, "Население"]
-                grad = population_to_gradation(pop_use)
+                grad = population_to_gradation(out.at[i, "Население"])
                 if grad is not None:
                     out.at[i, "Градация"] = grad
-
             if is_empty(out.at[i, "Категория"]):
-                grad_use = out.at[i, "Градация"]
-                cat = gradation_to_category(grad_use)
+                cat = gradation_to_category(out.at[i, "Градация"])
                 if cat is not None:
                     out.at[i, "Категория"] = cat
-
             continue
 
         out.at[i, "match_status"] = "не найдено"
@@ -565,7 +538,6 @@ def read_any(f):
             df = pd.read_csv(io.BytesIO(raw), encoding="cp1251")
     else:
         df = pd.read_excel(io.BytesIO(raw), sheet_name=0)
-
     df = df.loc[:, ~df.columns.duplicated()]
     return df
 
@@ -574,6 +546,24 @@ def read_any(f):
 st.set_page_config(page_title="Ближайшие НП", layout="wide")
 st.title("Расчёт ближайших населённых пунктов")
 
+# ==================== Сайдбар: справочник ====================
+with st.sidebar:
+    st.markdown("### Справочник")
+    if os.path.exists(SPRAVOCHNIK_FILE):
+        size_mb = os.path.getsize(SPRAVOCHNIK_FILE) / (1024 * 1024)
+        st.caption(f"✅ Сохранён: `{SPRAVOCHNIK_FILE}` ({size_mb:.1f} МБ)")
+    else:
+        st.caption("❌ Справочник не сохранён")
+
+    if st.button("🗑 Обновить справочник"):
+        if os.path.exists(SPRAVOCHNIK_FILE):
+            os.remove(SPRAVOCHNIK_FILE)
+        if "ds_df" in st.session_state:
+            del st.session_state["ds_df"]
+        st.success("Справочник удалён. Загрузите новый ниже.")
+        st.rerun()
+
+
 st.markdown("### 1. Загрузите список НП")
 user_file = st.file_uploader(
     "Ваш Excel/CSV (колонки: Тип НП, Город, Широта, Долгота, Население, Градация, Категория, Область, ФО, СВЗ регион)",
@@ -581,12 +571,28 @@ user_file = st.file_uploader(
     key="user_file"
 )
 
-st.markdown("### 2. Загрузите справочник")
-ds_file = st.file_uploader(
-    "Справочник (колонки: settlement, region, latitude_dd, longitude_dd, population)",
-    type=["xlsx", "xls", "csv"],
-    key="ds_file"
-)
+# === Справочник: с диска ИЛИ через загрузку ===
+spravochnik_exists = os.path.exists(SPRAVOCHNIK_FILE)
+
+if spravochnik_exists:
+    st.markdown("### 2. Справочник")
+    st.info(f"Используется сохранённый справочник `{SPRAVOCHNIK_FILE}`. Чтобы заменить — нажмите «🗑 Обновить справочник» в сайдбаре.")
+    if "ds_df" not in st.session_state:
+        st.session_state["ds_df"] = pd.read_csv(SPRAVOCHNIK_FILE, encoding="utf-8-sig")
+else:
+    st.markdown("### 2. Загрузите справочник (первый раз)")
+    ds_file = st.file_uploader(
+        "Справочник (колонки: settlement, region, latitude_dd, longitude_dd, population)",
+        type=["xlsx", "xls", "csv"],
+        key="ds_file"
+    )
+    if ds_file is not None:
+        if st.button("💾 Сохранить справочник"):
+            ds_df_tmp = read_any(ds_file)
+            ds_df_tmp.to_csv(SPRAVOCHNIK_FILE, index=False, encoding="utf-8-sig")
+            st.session_state["ds_df"] = ds_df_tmp
+            st.success(f"Справочник сохранён в `{SPRAVOCHNIK_FILE}`")
+            st.rerun()
 
 st.markdown("### 3. (Необязательно) Загрузите БДР")
 bdr_file = st.file_uploader(
@@ -602,9 +608,11 @@ sx_file = st.file_uploader(
     key="sx_file"
 )
 
-if user_file and ds_file:
+# === Основной блок ===
+ds_df = st.session_state.get("ds_df", None)
+
+if user_file and ds_df is not None:
     user_df_raw = clean_dataframe(read_any(user_file))
-    ds_df = read_any(ds_file)
     user_df = remove_duplicates(user_df_raw)
 
     st.subheader("Ваш список")
@@ -629,7 +637,6 @@ if user_file and ds_file:
 
     if not missing_user and not missing_ds:
         if st.button("1️⃣ Сопоставить"):
-            # Сброс зависимых
             for k in ["matched", "result_sheet", "avp", "avp_issues"]:
                 if k in st.session_state:
                     del st.session_state[k]
@@ -665,7 +672,6 @@ if user_file and ds_file:
 
         if "matched" in st.session_state:
             if st.button("2️⃣ Рассчитать и получить Excel"):
-                # Сброс зависимых
                 for k in ["result_sheet", "avp", "avp_issues"]:
                     if k in st.session_state:
                         del st.session_state[k]
@@ -752,7 +758,7 @@ if user_file and ds_file:
                     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 )
 
-        # === Кнопка "Рассчитать ср. цену анкеты" ===
+        # === Кнопка AvP ===
         can_build_avp = (
             bdr_file is not None and
             sx_file is not None and
@@ -775,7 +781,6 @@ if user_file and ds_file:
                     bdr_df = read_any(bdr_file)
                     sx_df = read_any(sx_file)
                     result_df = st.session_state["result_sheet"]
-
                     try:
                         avp, issues = build_avp(sx_df, bdr_df, result_df)
                         st.session_state["avp"] = avp
@@ -819,3 +824,8 @@ if user_file and ds_file:
                     "AvP.xlsx",
                     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 )
+else:
+    if not user_file:
+        st.info("Загрузите список НП (блок 1).")
+    if ds_df is None:
+        st.info("Загрузите справочник (блок 2).")
