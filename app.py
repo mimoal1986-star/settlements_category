@@ -4,10 +4,20 @@ import numpy as np
 import re
 import io
 import os
+import json
 from datetime import datetime, date
 
 R_EARTH = 6371.0
 SPRAVOCHNIK_FILE = "spravochnik.csv"
+KF_SLOZHNOSTI_FILE = "kf_slozhnosti.csv"
+KF_LOKAL_FILE = "kf_lokal.csv"
+COEFFICIENTS_FILE = "coefficients.json"
+
+# Дефолтные настройки ГУК
+DEFAULT_COEFFS = {
+    "kf_category": {1: 1.0, 2: 1.0, 3: 1.0, 4: 1.0, 5: 1.0, 6: 1.0},
+    "kf_doezd": 1.0,
+}
 
 NEW_COLS = [
     "Для НП 3-6 → НП 1, 2 Имя НП",
@@ -32,11 +42,6 @@ GRAD_TO_CAT = {
     "от 10 тыс. до 50 тыс": 5,
     "менее 10000": 6,
 }
-
-KF_CATEGORY = {1: 1, 2: 1, 3: 1, 4: 1, 5: 1, 6: 1}
-KF_DOEZD = 1
-KF_SLOZHNOST = 1
-KF_LOKAL = 1
 
 # ==================== СЛОВАРЬ КРУПНЫХ ГОРОДОВ ====================
 CITY_COORDS = {
@@ -92,6 +97,33 @@ CITY_COORDS = {
 }
 
 
+# ==================== ГУК ====================
+def load_coefficients():
+    """Читает coefficients.json или создаёт с дефолтами."""
+    if os.path.exists(COEFFICIENTS_FILE):
+        try:
+            with open(COEFFICIENTS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            # Приводим ключи kf_category к int
+            cat = data.get("kf_category", {})
+            cat = {int(k): float(v) for k, v in cat.items()}
+            return {
+                "kf_category": cat,
+                "kf_doezd": float(data.get("kf_doezd", 1.0)),
+            }
+        except Exception:
+            pass
+    # Создаём дефолт
+    save_coefficients(DEFAULT_COEFFS)
+    return dict(DEFAULT_COEFFS)
+
+
+def save_coefficients(data):
+    """Сохраняет coefficients.json."""
+    with open(COEFFICIENTS_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
 # ==================== УТИЛИТЫ ====================
 def squeeze(s):
     if pd.isna(s):
@@ -138,11 +170,70 @@ def to_float(v):
     s = str(v).strip()
     if s == "" or s == "-" or s == "—":
         return np.nan
+    # Обработка "95%" → 0.95
+    if s.endswith("%"):
+        s = s[:-1].strip()
+        s2 = s.replace(" ", "").replace(",", ".")
+        try:
+            return float(s2) / 100.0
+        except (ValueError, TypeError):
+            return np.nan
     s2 = s.replace(" ", "").replace(",", ".")
     try:
         return float(s2)
     except (ValueError, TypeError):
         return np.nan
+
+
+def parse_percent(v):
+    """Парсит '100%' → 1.0, '95%' → 0.95. Если не %, то to_float / 100."""
+    if v is None or is_empty(v):
+        return 1.0
+    s = str(v).strip()
+    if s.endswith("%"):
+        s = s[:-1].strip()
+        try:
+            return float(s.replace(",", ".")) / 100.0
+        except (ValueError, TypeError):
+            return 1.0
+    # Если просто число — пробуем как есть
+    f = to_float(s)
+    if pd.isna(f):
+        return 1.0
+    # Если больше 1 — вероятно проценты
+    if f > 1:
+        return f / 100.0
+    return f
+
+
+def load_kf_file(path):
+    """
+    Загружает KF-файл. Возвращает dict: Region short → коэффициент.
+    Формат: первая строка — заголовки (регионы), вторая — значения.
+    """
+    if not os.path.exists(path):
+        return {}
+    try:
+        df = pd.read_csv(path, encoding="utf-8-sig", header=None)
+    except Exception:
+        return {}
+    if len(df) < 2:
+        return {}
+
+    headers = df.iloc[0].tolist()
+    values = df.iloc[1].tolist()
+
+    result = {}
+    for h, v in zip(headers, values):
+        h_clean = squeeze(h)
+        if not h_clean:
+            continue
+        # Пропускаем служебные
+        if h_clean.lower() in ("проект", "код", "сценарий (идентификатор)*",
+                               "сценарий (идентификатор)"):
+            continue
+        result[h_clean.upper()] = parse_percent(v)
+    return result
 
 
 def population_to_gradation(pop):
@@ -274,7 +365,6 @@ def compute_city_new(sheet_res):
 
         matched_name = None
         matched_reg = None
-
         if not pd.isna(L_f) and L_f < 31:
             matched_name = K; matched_reg = K_reg
         elif not pd.isna(N_f) and N_f < 21:
@@ -301,7 +391,7 @@ def compute_city_new(sheet_res):
 
 
 # ==================== AVP ====================
-def build_avp(sx_df, bdr_df, result_df):
+def build_avp(sx_df, bdr_df, result_df, coeffs, kf_slozhnosti, kf_lokal):
     issues = {
         "no_region": pd.DataFrame(),
         "duplicates": pd.DataFrame(),
@@ -389,21 +479,37 @@ def build_avp(sx_df, bdr_df, result_df):
         issues["no_expenses"] = no_exp[["Client", "Project Name", "Wave Name",
                                          "Project Code"]]
 
+    # === КФ ===
+    kf_cat_settings = coeffs["kf_category"]
+    kf_doezd_value = coeffs["kf_doezd"]
+
     avp["КФ категории"] = avp["Категория new"].apply(
-        lambda c: KF_CATEGORY.get(int(c), 1) if not is_empty(c) else 1
+        lambda c: kf_cat_settings.get(int(c), 1.0) if not is_empty(c) else 1.0
     )
-    avp["КФ доезда"] = KF_DOEZD
-    avp["КФ сложности"] = KF_SLOZHNOST
-    avp["КФ локальной сложности"] = KF_LOKAL
+    avp["КФ доезда"] = kf_doezd_value
 
-    def calc_price(row):
-        exp = to_float(row["Расходы на ТП"])
-        if pd.isna(exp):
-            return np.nan
-        return exp * row["КФ категории"] * row["КФ доезда"] * row["КФ сложности"] * row["КФ локальной сложности"]
+    def find_kf_slozhnost(row):
+        reg = squeeze(row["Region short"]).upper()
+        return kf_slozhnosti.get(reg, 1.0)
 
-    avp["Цена анкеты"] = avp.apply(calc_price, axis=1)
+    def find_kf_lokal(row):
+        reg = squeeze(row["Region short"]).upper()
+        return kf_lokal.get(reg, 1.0)
 
+    avp["КФ сложности"] = avp.apply(find_kf_slozhnost, axis=1)
+    avp["КФ локальной сложности"] = avp.apply(find_kf_lokal, axis=1)
+
+    avp["КФ итог"] = (
+        (avp["КФ категории"] + avp["КФ доезда"]) *
+        avp["КФ сложности"] *
+        avp["КФ локальной сложности"]
+    ).round(2)
+
+    avp["Цена анкеты"] = (
+        avp["Расходы на ТП"].apply(to_float) * avp["КФ итог"]
+    ).round(2)
+
+    # Средняя цена проекта
     proj_keys = ["Client", "Project Name", "Wave Name", "Project Code"]
     avp["_key_tuple"] = avp.apply(
         lambda r: tuple(squeeze(r[k]) for k in proj_keys), axis=1
@@ -416,6 +522,26 @@ def build_avp(sx_df, bdr_df, result_df):
     )
     avp["Средняя цена проекта"] = avp["_key_tuple"].map(avg_price_map)
     avp = avp.drop(columns=["_key_tuple"])
+
+    # === Переименование колонок ===
+    rename_map = {
+        "Client": "Клиент Имя",
+        "Project Name": "Проект Имя",
+        "Wave Name": "Волна Имя",
+        "Project Code": "Проект Код",
+    }
+    avp = avp.rename(columns=rename_map)
+
+    # Финальный порядок колонок
+    final_order = [
+        "Клиент Имя", "Проект Имя", "Волна Имя", "Проект Код",
+        "Регион", "Город", "Region short",
+        "Категория new", "Расходы на ТП",
+        "КФ итог", "КФ категории", "КФ доезда",
+        "КФ сложности", "КФ локальной сложности",
+        "Цена анкеты", "Средняя цена проекта",
+    ]
+    avp = avp[[c for c in final_order if c in avp.columns]]
 
     return avp, issues
 
@@ -546,24 +672,82 @@ def read_any(f):
 st.set_page_config(page_title="Ближайшие НП", layout="wide")
 st.title("Расчёт ближайших населённых пунктов")
 
-# ==================== Сайдбар: справочник ====================
+# Загружаем настройки ГУК
+if "coeffs" not in st.session_state:
+    st.session_state["coeffs"] = load_coefficients()
+
+# ==================== Сайдбар ====================
 with st.sidebar:
-    st.markdown("### Справочник")
+    st.markdown("## Коэффициенты")
+
+    # === КФ категории ===
+    st.markdown("### КФ категории")
+    kf_cat = st.session_state["coeffs"]["kf_category"]
+    new_kf_cat = {}
+    for cat in range(1, 7):
+        val = st.slider(
+            f"Категория {cat}",
+            min_value=1.0, max_value=2.0, step=0.05,
+            value=float(kf_cat.get(cat, 1.0)),
+            key=f"kf_cat_{cat}"
+        )
+        new_kf_cat[cat] = round(val, 2)
+
+    # === КФ доезда ===
+    st.markdown("### КФ доезда")
+    new_kf_doezd = st.slider(
+        "КФ доезда",
+        min_value=0.0, max_value=1.0, step=0.05,
+        value=float(st.session_state["coeffs"]["kf_doezd"]),
+        key="kf_doezd_slider"
+    )
+    new_kf_doezd = round(new_kf_doezd, 2)
+
+    # Сохраняем если изменилось
+    if (new_kf_cat != kf_cat) or (new_kf_doezd != st.session_state["coeffs"]["kf_doezd"]):
+        st.session_state["coeffs"] = {
+            "kf_category": new_kf_cat,
+            "kf_doezd": new_kf_doezd,
+        }
+        save_coefficients(st.session_state["coeffs"])
+
+    st.markdown("---")
+    st.markdown("### Справочники")
+
+    # === Справочник НП ===
     if os.path.exists(SPRAVOCHNIK_FILE):
         size_mb = os.path.getsize(SPRAVOCHNIK_FILE) / (1024 * 1024)
-        st.caption(f"✅ Сохранён: `{SPRAVOCHNIK_FILE}` ({size_mb:.1f} МБ)")
+        st.caption(f"✅ НП: `{SPRAVOCHNIK_FILE}` ({size_mb:.1f} МБ)")
     else:
-        st.caption("❌ Справочник не сохранён")
-
-    if st.button("🗑 Обновить справочник"):
+        st.caption("❌ НП: не сохранён")
+    if st.button("🗑 Обновить НП"):
         if os.path.exists(SPRAVOCHNIK_FILE):
             os.remove(SPRAVOCHNIK_FILE)
         if "ds_df" in st.session_state:
             del st.session_state["ds_df"]
-        st.success("Справочник удалён. Загрузите новый ниже.")
         st.rerun()
 
+    # === КФ сложности ===
+    if os.path.exists(KF_SLOZHNOSTI_FILE):
+        st.caption(f"✅ КФ сложности: `{KF_SLOZHNOSTI_FILE}`")
+    else:
+        st.caption("❌ КФ сложности: не сохранён")
+    if st.button("🗑 Обновить КФ сложности"):
+        if os.path.exists(KF_SLOZHNOSTI_FILE):
+            os.remove(KF_SLOZHNOSTI_FILE)
+        st.rerun()
 
+    # === КФ локальной ===
+    if os.path.exists(KF_LOKAL_FILE):
+        st.caption(f"✅ КФ локальной: `{KF_LOKAL_FILE}`")
+    else:
+        st.caption("❌ КФ локальной: не сохранён")
+    if st.button("🗑 Обновить КФ локальной"):
+        if os.path.exists(KF_LOKAL_FILE):
+            os.remove(KF_LOKAL_FILE)
+        st.rerun()
+
+# ==================== Основная часть ====================
 st.markdown("### 1. Загрузите список НП")
 user_file = st.file_uploader(
     "Ваш Excel/CSV (колонки: Тип НП, Город, Широта, Долгота, Население, Градация, Категория, Область, ФО, СВЗ регион)",
@@ -571,37 +755,81 @@ user_file = st.file_uploader(
     key="user_file"
 )
 
-# === Справочник: с диска ИЛИ через загрузку ===
+# === Справочник НП ===
 spravochnik_exists = os.path.exists(SPRAVOCHNIK_FILE)
-
 if spravochnik_exists:
-    st.markdown("### 2. Справочник")
-    st.info(f"Используется сохранённый справочник `{SPRAVOCHNIK_FILE}`. Чтобы заменить — нажмите «🗑 Обновить справочник» в сайдбаре.")
+    st.markdown("### 2. Справочник НП")
+    st.info(f"Используется сохранённый справочник `{SPRAVOCHNIK_FILE}`.")
     if "ds_df" not in st.session_state:
         st.session_state["ds_df"] = pd.read_csv(SPRAVOCHNIK_FILE, encoding="utf-8-sig")
 else:
-    st.markdown("### 2. Загрузите справочник (первый раз)")
+    st.markdown("### 2. Загрузите справочник НП (первый раз)")
     ds_file = st.file_uploader(
-        "Справочник (колонки: settlement, region, latitude_dd, longitude_dd, population)",
+        "Справочник НП (settlement, region, latitude_dd, longitude_dd, population)",
         type=["xlsx", "xls", "csv"],
         key="ds_file"
     )
     if ds_file is not None:
-        if st.button("💾 Сохранить справочник"):
+        if st.button("💾 Сохранить справочник НП"):
             ds_df_tmp = read_any(ds_file)
             ds_df_tmp.to_csv(SPRAVOCHNIK_FILE, index=False, encoding="utf-8-sig")
             st.session_state["ds_df"] = ds_df_tmp
-            st.success(f"Справочник сохранён в `{SPRAVOCHNIK_FILE}`")
+            st.success(f"Сохранено в `{SPRAVOCHNIK_FILE}`")
             st.rerun()
 
-st.markdown("### 3. (Необязательно) Загрузите БДР")
+# === КФ сложности ===
+if not os.path.exists(KF_SLOZHNOSTI_FILE):
+    st.markdown("### 3. Загрузите файл КФ сложности (первый раз)")
+    kf_slozhnosti_file = st.file_uploader(
+        "КФ сложности (первая строка — регионы, вторая — значения %)",
+        type=["xlsx", "xls", "csv"],
+        key="kf_slozhnosti_file"
+    )
+    if kf_slozhnosti_file is not None:
+        if st.button("💾 Сохранить КФ сложности"):
+            raw = kf_slozhnosti_file.read()
+            if kf_slozhnosti_file.name.lower().endswith(".csv"):
+                try:
+                    df_tmp = pd.read_csv(io.BytesIO(raw), encoding="utf-8-sig", header=None)
+                except Exception:
+                    df_tmp = pd.read_csv(io.BytesIO(raw), encoding="cp1251", header=None)
+            else:
+                df_tmp = pd.read_excel(io.BytesIO(raw), sheet_name=0, header=None)
+            df_tmp.to_csv(KF_SLOZHNOSTI_FILE, index=False, header=False, encoding="utf-8-sig")
+            st.success(f"Сохранено в `{KF_SLOZHNOSTI_FILE}`")
+            st.rerun()
+
+# === КФ локальной ===
+if not os.path.exists(KF_LOKAL_FILE):
+    st.markdown("### 4. Загрузите файл КФ локальной сложности (первый раз)")
+    kf_lokal_file = st.file_uploader(
+        "КФ локальной (первая строка — регионы, вторая — значения %)",
+        type=["xlsx", "xls", "csv"],
+        key="kf_lokal_file"
+    )
+    if kf_lokal_file is not None:
+        if st.button("💾 Сохранить КФ локальной"):
+            raw = kf_lokal_file.read()
+            if kf_lokal_file.name.lower().endswith(".csv"):
+                try:
+                    df_tmp = pd.read_csv(io.BytesIO(raw), encoding="utf-8-sig", header=None)
+                except Exception:
+                    df_tmp = pd.read_csv(io.BytesIO(raw), encoding="cp1251", header=None)
+            else:
+                df_tmp = pd.read_excel(io.BytesIO(raw), sheet_name=0, header=None)
+            df_tmp.to_csv(KF_LOKAL_FILE, index=False, header=False, encoding="utf-8-sig")
+            st.success(f"Сохранено в `{KF_LOKAL_FILE}`")
+            st.rerun()
+
+# === БДР и СХ ===
+st.markdown("### 5. (Необязательно) Загрузите БДР")
 bdr_file = st.file_uploader(
     "БДР (колонки: КОД, Расходы на ТП/Респонденты (план на 1 ед.))",
     type=["xlsx", "xls", "csv"],
     key="bdr_file"
 )
 
-st.markdown("### 4. (Необязательно) Загрузите СХ")
+st.markdown("### 6. (Необязательно) Загрузите СХ")
 sx_file = st.file_uploader(
     "СХ (колонки: Client, Project Name, Wave Name, Project Code, Регион, Город, Region short)",
     type=["xlsx", "xls", "csv"],
@@ -618,10 +846,6 @@ if user_file and ds_df is not None:
     st.subheader("Ваш список")
     st.dataframe(user_df_raw.head(5), use_container_width=True)
     st.caption(f"Строк: {len(user_df_raw)}")
-
-    st.subheader("Справочник")
-    st.dataframe(ds_df.head(5), use_container_width=True)
-    st.caption(f"Строк: {len(ds_df)}")
 
     required_user = ["Тип НП", "Город", "Широта", "Долгота", "Население",
                      "Градация", "Категория", "Область", "ФО", "СВЗ регион"]
@@ -759,10 +983,15 @@ if user_file and ds_df is not None:
                 )
 
         # === Кнопка AvP ===
+        kf_slozhnosti_ready = os.path.exists(KF_SLOZHNOSTI_FILE)
+        kf_lokal_ready = os.path.exists(KF_LOKAL_FILE)
+
         can_build_avp = (
             bdr_file is not None and
             sx_file is not None and
-            "result_sheet" in st.session_state
+            "result_sheet" in st.session_state and
+            kf_slozhnosti_ready and
+            kf_lokal_ready
         )
 
         st.markdown("---")
@@ -774,6 +1003,10 @@ if user_file and ds_df is not None:
                 reasons.append("не загружен СХ")
             if "result_sheet" not in st.session_state:
                 reasons.append("не выполнен расчёт категорий (кнопка 2️⃣)")
+            if not kf_slozhnosti_ready:
+                reasons.append("не сохранён КФ сложности")
+            if not kf_lokal_ready:
+                reasons.append("не сохранён КФ локальной")
             st.info(f"Кнопка «Рассчитать ср. цену анкеты» станет доступна, когда: {', '.join(reasons)}")
         else:
             if st.button("3️⃣ Рассчитать ср. цену анкеты"):
@@ -781,8 +1014,15 @@ if user_file and ds_df is not None:
                     bdr_df = read_any(bdr_file)
                     sx_df = read_any(sx_file)
                     result_df = st.session_state["result_sheet"]
+                    coeffs = st.session_state["coeffs"]
+                    kf_slozhnosti = load_kf_file(KF_SLOZHNOSTI_FILE)
+                    kf_lokal = load_kf_file(KF_LOKAL_FILE)
+
                     try:
-                        avp, issues = build_avp(sx_df, bdr_df, result_df)
+                        avp, issues = build_avp(
+                            sx_df, bdr_df, result_df,
+                            coeffs, kf_slozhnosti, kf_lokal
+                        )
                         st.session_state["avp"] = avp
                         st.session_state["avp_issues"] = issues
                     except ValueError as e:
@@ -804,11 +1044,11 @@ if user_file and ds_df is not None:
                     st.dataframe(issues["duplicates"].head(50), use_container_width=True)
 
                 if len(issues["no_category"]):
-                    st.warning(f"⚠ Не нашли Категория new для: {len(issues['no_category'])} строк AvP")
+                    st.warning(f"⚠ Не нашли Категория new: {len(issues['no_category'])} строк")
                     st.dataframe(issues["no_category"].head(50), use_container_width=True)
 
                 if len(issues["no_expenses"]):
-                    st.warning(f"⚠ Не нашли Расходы на ТП для: {len(issues['no_expenses'])} строк AvP")
+                    st.warning(f"⚠ Не нашли Расходы на ТП: {len(issues['no_expenses'])} строк")
                     st.dataframe(issues["no_expenses"].head(50), use_container_width=True)
 
                 st.subheader("Предпросмотр AvP")
@@ -828,4 +1068,4 @@ else:
     if not user_file:
         st.info("Загрузите список НП (блок 1).")
     if ds_df is None:
-        st.info("Загрузите справочник (блок 2).")
+        st.info("Загрузите или сохраните справочник НП (блок 2).")
