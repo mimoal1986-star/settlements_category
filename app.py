@@ -31,6 +31,12 @@ GRAD_TO_CAT = {
     "менее 10000": 6,
 }
 
+# Коэффициенты (все = 1, потом улучшим)
+KF_CATEGORY = {1: 1, 2: 1, 3: 1, 4: 1, 5: 1, 6: 1}
+KF_DOEZD = 1
+KF_SLOZHNOST = 1
+KF_LOKAL = 1
+
 # ==================== СЛОВАРЬ КРУПНЫХ ГОРОДОВ ====================
 CITY_COORDS = {
     "москва": (55.7558, 37.6173),
@@ -223,19 +229,11 @@ def final_dedup(df):
 
 # ==================== ГОРОД NEW / ОБЛАСТЬ NEW / КАТЕГОРИЯ NEW ====================
 def compute_city_new(sheet_res):
-    """
-    Город new / Область new / Категория new:
-      - если сработал порог (L<31 / N<21 / P<11) → имя и область ближайшего
-        (из соответствующих колонок этой строки), категория — по ключу
-        (Город new, Область new) из словаря
-      - иначе → Город / Область / Категория ИЗ ЭТОЙ ЖЕ СТРОКИ
-    """
     sheet_res = sheet_res.copy()
     sheet_res["Город new"] = None
     sheet_res["Область new"] = None
     sheet_res["Категория new"] = None
 
-    # Уникальный словарь: (Город, Область) → Категория
     city_to_cat = {}
     for _, row in sheet_res.iterrows():
         city = squeeze(row["Город"])
@@ -303,6 +301,129 @@ def compute_city_new(sheet_res):
     return sheet_res
 
 
+# ==================== AVP ====================
+def build_avp(sx_df, bdr_df, result_df):
+    """
+    Строит AvP. Возвращает (avp_df, issues).
+    """
+    issues = {
+        "no_region": pd.DataFrame(),
+        "duplicates": pd.DataFrame(),
+        "no_category": pd.DataFrame(),
+        "no_expenses": pd.DataFrame(),
+    }
+
+    sx_keys = ["Client", "Project Name", "Wave Name", "Project Code", "Регион", "Город"]
+    missing_sx = [c for c in sx_keys + ["Region short"] if c not in sx_df.columns]
+    if missing_sx:
+        raise ValueError(f"В СХ нет колонок: {missing_sx}")
+
+    # Уникальные связки из СХ
+    avp = sx_df[sx_keys + ["Region short"]].drop_duplicates(
+        subset=sx_keys + ["Region short"]
+    ).reset_index(drop=True)
+
+    # Словарь (Город, СВЗ регион) → Категория new
+    if "СВЗ регион" not in result_df.columns:
+        raise ValueError("В result нет колонки 'СВЗ регион'")
+
+    bad_region = result_df[
+        result_df["СВЗ регион"].apply(is_empty)
+    ][["Город", "Область", "СВЗ регион", "match_status"]]
+    issues["no_region"] = bad_region
+
+    city_cat_map = {}
+    dup_rows = []
+    for _, r in result_df.iterrows():
+        city = squeeze(r["Город"]).lower()
+        reg = squeeze(r["СВЗ регион"]).lower()
+        cat_new = r.get("Категория new")
+        if not city or not reg:
+            continue
+        key = (city, reg)
+        if key in city_cat_map:
+            dup_rows.append({
+                "Город": r["Город"],
+                "СВЗ регион": r["СВЗ регион"],
+                "Категория new": cat_new,
+            })
+            continue
+        city_cat_map[key] = cat_new
+
+    if dup_rows:
+        issues["duplicates"] = pd.DataFrame(dup_rows)
+
+    # Обогащение: Категория new
+    def find_cat(row):
+        city = squeeze(row["Город"]).lower()
+        reg = squeeze(row["Region short"]).lower()
+        if not city or not reg:
+            return None
+        return city_cat_map.get((city, reg))
+
+    avp["Категория new"] = avp.apply(find_cat, axis=1)
+
+    no_cat = avp[avp["Категория new"].apply(is_empty)]
+    if len(no_cat):
+        issues["no_category"] = no_cat[["Client", "Project Name", "Wave Name",
+                                         "Project Code", "Город", "Region short"]]
+
+    # Средние Расходы на ТП из БДР
+    bdr_col_code = "КОД"
+    bdr_col_exp = "Расходы на ТП/Респонденты (план на 1 ед.)"
+
+    if bdr_col_code not in bdr_df.columns or bdr_col_exp not in bdr_df.columns:
+        raise ValueError(f"В БДР нет колонок '{bdr_col_code}' или '{bdr_col_exp}'")
+
+    bdr = bdr_df[[bdr_col_code, bdr_col_exp]].copy()
+    bdr[bdr_col_exp] = bdr[bdr_col_exp].apply(to_float)
+    bdr["_code"] = bdr[bdr_col_code].apply(squeeze)
+
+    bdr_avg = bdr.groupby("_code")[bdr_col_exp].mean().to_dict()
+
+    def find_exp(code):
+        return bdr_avg.get(squeeze(code))
+
+    avp["Расходы на ТП"] = avp["Project Code"].apply(find_exp)
+
+    no_exp = avp[avp["Расходы на ТП"].apply(is_empty)]
+    if len(no_exp):
+        issues["no_expenses"] = no_exp[["Client", "Project Name", "Wave Name",
+                                         "Project Code"]]
+
+    # КФ и Цена анкеты
+    avp["КФ категории"] = avp["Категория new"].apply(
+        lambda c: KF_CATEGORY.get(int(c), 1) if not is_empty(c) else 1
+    )
+    avp["КФ доезда"] = KF_DOEZD
+    avp["КФ сложности"] = KF_SLOZHNOST
+    avp["КФ локальной сложности"] = KF_LOKAL
+
+    def calc_price(row):
+        exp = to_float(row["Расходы на ТП"])
+        if pd.isna(exp):
+            return np.nan
+        return exp * row["КФ категории"] * row["КФ доезда"] * row["КФ сложности"] * row["КФ локальной сложности"]
+
+    avp["Цена анкеты"] = avp.apply(calc_price, axis=1)
+
+    # Средняя цена проекта
+    proj_keys = ["Client", "Project Name", "Wave Name", "Project Code"]
+    avp["_key_tuple"] = avp.apply(
+        lambda r: tuple(squeeze(r[k]) for k in proj_keys), axis=1
+    )
+    avg_price_map = (
+        avp.dropna(subset=["Цена анкеты"])
+           .groupby("_key_tuple")["Цена анкеты"]
+           .mean()
+           .to_dict()
+    )
+    avp["Средняя цена проекта"] = avp["_key_tuple"].map(avg_price_map)
+    avp = avp.drop(columns=["_key_tuple"])
+
+    return avp, issues
+
+
 # ==================== ГЕОМЕТРИЯ ====================
 def haversine_matrix(lat1, lon1, lat2, lon2):
     lat1 = np.radians(np.asarray(lat1, dtype=float))[:, None]
@@ -317,10 +438,6 @@ def haversine_matrix(lat1, lon1, lat2, lon2):
 
 
 def find_nearest(src_df, tgt_df):
-    """
-    Возвращает (names, regions, dists).
-    Фильтрует target по наличию координат, имени и области.
-    """
     n = len(src_df)
     names = np.array([None] * n, dtype=object)
     regions = np.array([None] * n, dtype=object)
@@ -433,10 +550,15 @@ def read_any(f):
     raw = f.read()
     if f.name.lower().endswith(".csv"):
         try:
-            return pd.read_csv(io.BytesIO(raw), encoding="utf-8-sig")
+            df = pd.read_csv(io.BytesIO(raw), encoding="utf-8-sig")
         except (UnicodeDecodeError, UnicodeError):
-            return pd.read_csv(io.BytesIO(raw), encoding="cp1251")
-    return pd.read_excel(io.BytesIO(raw), sheet_name=0)
+            df = pd.read_csv(io.BytesIO(raw), encoding="cp1251")
+    else:
+        df = pd.read_excel(io.BytesIO(raw), sheet_name=0)
+
+    # Удаляем дубли колонок — оставляем первую
+    df = df.loc[:, ~df.columns.duplicated()]
+    return df
 
 
 # ==================== UI ====================
@@ -455,6 +577,20 @@ ds_file = st.file_uploader(
     "Справочник (колонки: settlement, region, latitude_dd, longitude_dd, population)",
     type=["xlsx", "xls", "csv"],
     key="ds_file"
+)
+
+st.markdown("### 3. (Необязательно) Загрузите БДР")
+bdr_file = st.file_uploader(
+    "БДР (колонки: КОД, Расходы на ТП/Респонденты (план на 1 ед.))",
+    type=["xlsx", "xls", "csv"],
+    key="bdr_file"
+)
+
+st.markdown("### 4. (Необязательно) Загрузите СХ")
+sx_file = st.file_uploader(
+    "СХ (колонки: Client, Project Name, Wave Name, Project Code, Регион, Город, Region short)",
+    type=["xlsx", "xls", "csv"],
+    key="sx_file"
 )
 
 if user_file and ds_file:
@@ -540,21 +676,18 @@ if user_file and ds_file:
                 for c in NEW_COLS:
                     work[c] = None
 
-                # Правило 1: 3-6 → 1,2
                 if len(g3456) and len(g12):
                     names, regions, dists = find_nearest(g3456, g12)
                     work.loc[g3456.index, "Для НП 3-6 → НП 1, 2 Имя НП"] = names
                     work.loc[g3456.index, "Для НП 3-6 → НП 1, 2 Область"] = regions
                     work.loc[g3456.index, "Для НП 3-6 → НП 1, 2 расстояние"] = np.round(dists, 2)
 
-                # Правило 2: 5-6 → 3,4
                 if len(g56) and len(g34):
                     names, regions, dists = find_nearest(g56, g34)
                     work.loc[g56.index, "Для НП 5-6 → НП 3, 4 Имя НП"] = names
                     work.loc[g56.index, "Для НП 5-6 → НП 3, 4 Область"] = regions
                     work.loc[g56.index, "Для НП 5-6 → НП 3, 4 расстояние"] = np.round(dists, 2)
 
-                # Правило 3: 6 → 5
                 if len(g6) and len(g5):
                     names, regions, dists = find_nearest(g6, g5)
                     work.loc[g6.index, "Для НП 6 → НП 5 Имя НП"] = names
@@ -594,6 +727,8 @@ if user_file and ds_file:
                     if len(sheet_nf):
                         sheet_nf.to_excel(writer, sheet_name="Не_найдено", index=False)
 
+                st.session_state["result_sheet"] = sheet_res
+
                 st.success("Готово!")
                 st.download_button(
                     "⬇ Скачать result.xlsx",
@@ -601,3 +736,66 @@ if user_file and ds_file:
                     "result.xlsx",
                     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 )
+
+        # === Кнопка "Рассчитать ср. цену анкеты" ===
+        can_build_avp = (
+            bdr_file is not None and
+            sx_file is not None and
+            "result_sheet" in st.session_state
+        )
+
+        st.markdown("---")
+        if not can_build_avp:
+            reasons = []
+            if bdr_file is None:
+                reasons.append("не загружен БДР")
+            if sx_file is None:
+                reasons.append("не загружен СХ")
+            if "result_sheet" not in st.session_state:
+                reasons.append("не выполнен расчёт категорий (кнопка 2️⃣)")
+            st.info(f"Кнопка «Рассчитать ср. цену анкеты» станет доступна, когда: {', '.join(reasons)}")
+        else:
+            if st.button("3️⃣ Рассчитать ср. цену анкеты"):
+                with st.spinner("Считаем AvP..."):
+                    bdr_df = read_any(bdr_file)
+                    sx_df = read_any(sx_file)
+                    result_df = st.session_state["result_sheet"]
+
+                    try:
+                        avp, issues = build_avp(sx_df, bdr_df, result_df)
+                    except ValueError as e:
+                        st.error(f"Ошибка: {e}")
+                        avp = None
+
+                if avp is not None:
+                    st.success(f"Готово! Строк в AvP: {len(avp)}")
+
+                    if len(issues["no_region"]):
+                        st.warning(f"⚠ СВЗ регион пусто: {len(issues['no_region'])} строк в result")
+                        st.dataframe(issues["no_region"].head(50), use_container_width=True)
+
+                    if len(issues["duplicates"]):
+                        st.warning(f"⚠ Дубликаты (Город, СВЗ регион) в result: {len(issues['duplicates'])}")
+                        st.dataframe(issues["duplicates"].head(50), use_container_width=True)
+
+                    if len(issues["no_category"]):
+                        st.warning(f"⚠ Не нашли Категория new для: {len(issues['no_category'])} строк AvP")
+                        st.dataframe(issues["no_category"].head(50), use_container_width=True)
+
+                    if len(issues["no_expenses"]):
+                        st.warning(f"⚠ Не нашли Расходы на ТП для: {len(issues['no_expenses'])} строк AvP")
+                        st.dataframe(issues["no_expenses"].head(50), use_container_width=True)
+
+                    st.subheader("Предпросмотр AvP")
+                    st.dataframe(avp.head(20), use_container_width=True)
+
+                    buf_avp = io.BytesIO()
+                    with pd.ExcelWriter(buf_avp, engine="openpyxl") as writer:
+                        avp.to_excel(writer, sheet_name="AvP", index=False)
+
+                    st.download_button(
+                        "⬇ Скачать AvP.xlsx",
+                        buf_avp.getvalue(),
+                        "AvP.xlsx",
+                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    )
