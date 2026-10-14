@@ -31,7 +31,6 @@ GRAD_TO_CAT = {
     "менее 10000": 6,
 }
 
-# Коэффициенты (все = 1, потом улучшим)
 KF_CATEGORY = {1: 1, 2: 1, 3: 1, 4: 1, 5: 1, 6: 1}
 KF_DOEZD = 1
 KF_SLOZHNOST = 1
@@ -96,6 +95,17 @@ def squeeze(s):
     if pd.isna(s):
         return ""
     return re.sub(r"\s+", " ", str(s).strip())
+
+
+def find_col(df, target):
+    """Ищет колонку по нормализованному имени (squeeze + lower). Берёт первую."""
+    if target is None:
+        return None
+    target_norm = squeeze(target).lower()
+    for c in df.columns:
+        if squeeze(c).lower() == target_norm:
+            return c
+    return None
 
 
 def is_empty(v):
@@ -303,9 +313,6 @@ def compute_city_new(sheet_res):
 
 # ==================== AVP ====================
 def build_avp(sx_df, bdr_df, result_df):
-    """
-    Строит AvP. Возвращает (avp_df, issues).
-    """
     issues = {
         "no_region": pd.DataFrame(),
         "duplicates": pd.DataFrame(),
@@ -313,38 +320,44 @@ def build_avp(sx_df, bdr_df, result_df):
         "no_expenses": pd.DataFrame(),
     }
 
-    sx_keys = ["Client", "Project Name", "Wave Name", "Project Code", "Регион", "Город"]
-    missing_sx = [c for c in sx_keys + ["Region short"] if c not in sx_df.columns]
-    if missing_sx:
-        raise ValueError(f"В СХ нет колонок: {missing_sx}")
+    # Ищем колонки в СХ
+    sx_key_names = ["Client", "Project Name", "Wave Name", "Project Code", "Регион", "Город"]
+    sx_cols = {}
+    for name in sx_key_names + ["Region short"]:
+        col = find_col(sx_df, name)
+        if col is None:
+            raise ValueError(f"В СХ нет колонки: {name}")
+        sx_cols[name] = col
 
-    # Уникальные связки из СХ
-    avp = sx_df[sx_keys + ["Region short"]].drop_duplicates(
-        subset=sx_keys + ["Region short"]
+    sx_selected = sx_df[[sx_cols[k] for k in sx_key_names] + [sx_cols["Region short"]]].copy()
+    sx_selected.columns = sx_key_names + ["Region short"]
+    avp = sx_selected.drop_duplicates(
+        subset=sx_key_names + ["Region short"]
     ).reset_index(drop=True)
 
-    # Словарь (Город, СВЗ регион) → Категория new
-    if "СВЗ регион" not in result_df.columns:
-        raise ValueError("В result нет колонки 'СВЗ регион'")
+    # Ищем колонки в result
+    res_city = find_col(result_df, "Город")
+    res_region = find_col(result_df, "СВЗ регион")
+    if res_city is None or res_region is None:
+        raise ValueError("В result нет колонок 'Город' или 'СВЗ регион'")
 
-    bad_region = result_df[
-        result_df["СВЗ регион"].apply(is_empty)
-    ][["Город", "Область", "СВЗ регион", "match_status"]]
+    bad_region_mask = result_df[res_region].apply(is_empty)
+    bad_region = result_df[bad_region_mask][[res_city, res_region]]
     issues["no_region"] = bad_region
 
     city_cat_map = {}
     dup_rows = []
     for _, r in result_df.iterrows():
-        city = squeeze(r["Город"]).lower()
-        reg = squeeze(r["СВЗ регион"]).lower()
+        city = squeeze(r[res_city]).lower()
+        reg = squeeze(r[res_region]).lower()
         cat_new = r.get("Категория new")
         if not city or not reg:
             continue
         key = (city, reg)
         if key in city_cat_map:
             dup_rows.append({
-                "Город": r["Город"],
-                "СВЗ регион": r["СВЗ регион"],
+                "Город": r[res_city],
+                "СВЗ регион": r[res_region],
                 "Категория new": cat_new,
             })
             continue
@@ -353,7 +366,6 @@ def build_avp(sx_df, bdr_df, result_df):
     if dup_rows:
         issues["duplicates"] = pd.DataFrame(dup_rows)
 
-    # Обогащение: Категория new
     def find_cat(row):
         city = squeeze(row["Город"]).lower()
         reg = squeeze(row["Region short"]).lower()
@@ -368,18 +380,18 @@ def build_avp(sx_df, bdr_df, result_df):
         issues["no_category"] = no_cat[["Client", "Project Name", "Wave Name",
                                          "Project Code", "Город", "Region short"]]
 
-    # Средние Расходы на ТП из БДР
-    bdr_col_code = "КОД"
-    bdr_col_exp = "Расходы на ТП/Респонденты (план на 1 ед.)"
+    # Ищем колонки в БДР
+    bdr_code = find_col(bdr_df, "КОД")
+    bdr_exp = find_col(bdr_df, "Расходы на ТП/Респонденты (план на 1 ед.)")
+    if bdr_code is None or bdr_exp is None:
+        raise ValueError("В БДР нет колонок 'КОД' или 'Расходы на ТП/Респонденты (план на 1 ед.)'")
 
-    if bdr_col_code not in bdr_df.columns or bdr_col_exp not in bdr_df.columns:
-        raise ValueError(f"В БДР нет колонок '{bdr_col_code}' или '{bdr_col_exp}'")
+    bdr = bdr_df[[bdr_code, bdr_exp]].copy()
+    bdr.columns = ["_code", "_exp"]
+    bdr["_exp"] = bdr["_exp"].apply(to_float)
+    bdr["_code"] = bdr["_code"].apply(squeeze)
 
-    bdr = bdr_df[[bdr_col_code, bdr_col_exp]].copy()
-    bdr[bdr_col_exp] = bdr[bdr_col_exp].apply(to_float)
-    bdr["_code"] = bdr[bdr_col_code].apply(squeeze)
-
-    bdr_avg = bdr.groupby("_code")[bdr_col_exp].mean().to_dict()
+    bdr_avg = bdr.groupby("_code")["_exp"].mean().to_dict()
 
     def find_exp(code):
         return bdr_avg.get(squeeze(code))
@@ -391,7 +403,6 @@ def build_avp(sx_df, bdr_df, result_df):
         issues["no_expenses"] = no_exp[["Client", "Project Name", "Wave Name",
                                          "Project Code"]]
 
-    # КФ и Цена анкеты
     avp["КФ категории"] = avp["Категория new"].apply(
         lambda c: KF_CATEGORY.get(int(c), 1) if not is_empty(c) else 1
     )
@@ -407,7 +418,6 @@ def build_avp(sx_df, bdr_df, result_df):
 
     avp["Цена анкеты"] = avp.apply(calc_price, axis=1)
 
-    # Средняя цена проекта
     proj_keys = ["Client", "Project Name", "Wave Name", "Project Code"]
     avp["_key_tuple"] = avp.apply(
         lambda r: tuple(squeeze(r[k]) for k in proj_keys), axis=1
@@ -556,7 +566,6 @@ def read_any(f):
     else:
         df = pd.read_excel(io.BytesIO(raw), sheet_name=0)
 
-    # Удаляем дубли колонок — оставляем первую
     df = df.loc[:, ~df.columns.duplicated()]
     return df
 
@@ -596,6 +605,7 @@ sx_file = st.file_uploader(
 if user_file and ds_file:
     user_df_raw = clean_dataframe(read_any(user_file))
     ds_df = read_any(ds_file)
+    user_df = remove_duplicates(user_df_raw)
 
     st.subheader("Ваш список")
     st.dataframe(user_df_raw.head(5), use_container_width=True)
@@ -618,9 +628,12 @@ if user_file and ds_file:
         st.error(f"В справочнике нет колонок: {missing_ds}")
 
     if not missing_user and not missing_ds:
-        user_df = remove_duplicates(user_df_raw)
-
         if st.button("1️⃣ Сопоставить"):
+            # Сброс зависимых
+            for k in ["matched", "result_sheet", "avp", "avp_issues"]:
+                if k in st.session_state:
+                    del st.session_state[k]
+
             with st.spinner("Сопоставляем..."):
                 matched = match_settlements(user_df, ds_df)
 
@@ -652,8 +665,13 @@ if user_file and ds_file:
 
         if "matched" in st.session_state:
             if st.button("2️⃣ Рассчитать и получить Excel"):
+                # Сброс зависимых
+                for k in ["result_sheet", "avp", "avp_issues"]:
+                    if k in st.session_state:
+                        del st.session_state[k]
+
                 work = st.session_state["matched"].copy()
-                user_df = st.session_state["user_df"]
+                user_df_saved = st.session_state.get("user_df", user_df)
 
                 work["_name_orig"] = work["Город"].astype(str).str.strip()
                 work["_region_orig"] = work["Область"].astype(str).str.strip()
@@ -700,9 +718,8 @@ if user_file and ds_file:
                     cat_filled
                 )
 
-                # === ЛИСТ «РЕЗУЛЬТАТ» ===
                 sheet_res = work[in_result].copy()
-                orig_cols = [c for c in user_df.columns if c in sheet_res.columns]
+                orig_cols = [c for c in user_df_saved.columns if c in sheet_res.columns]
                 sheet_res = sheet_res[orig_cols + ["match_status"] + NEW_COLS]
 
                 sheet_res = final_dedup(sheet_res)
@@ -715,12 +732,10 @@ if user_file and ds_file:
                     orig_cols + ["match_status"] + NEW_COLS + FINAL_COLS
                 ]
 
-                # === ЛИСТ «НЕ_НАЙДЕНО» ===
                 sheet_nf = work[~in_result].copy()
-                nf_cols = [c for c in user_df.columns if c in sheet_nf.columns]
+                nf_cols = [c for c in user_df_saved.columns if c in sheet_nf.columns]
                 sheet_nf = sheet_nf[nf_cols + ["match_status"]]
 
-                # === ВЫГРУЗКА ===
                 buf = io.BytesIO()
                 with pd.ExcelWriter(buf, engine="openpyxl") as writer:
                     sheet_res.to_excel(writer, sheet_name="Результат", index=False)
@@ -763,39 +778,44 @@ if user_file and ds_file:
 
                     try:
                         avp, issues = build_avp(sx_df, bdr_df, result_df)
+                        st.session_state["avp"] = avp
+                        st.session_state["avp_issues"] = issues
                     except ValueError as e:
                         st.error(f"Ошибка: {e}")
                         avp = None
 
-                if avp is not None:
-                    st.success(f"Готово! Строк в AvP: {len(avp)}")
+            if "avp" in st.session_state:
+                avp = st.session_state["avp"]
+                issues = st.session_state["avp_issues"]
 
-                    if len(issues["no_region"]):
-                        st.warning(f"⚠ СВЗ регион пусто: {len(issues['no_region'])} строк в result")
-                        st.dataframe(issues["no_region"].head(50), use_container_width=True)
+                st.success(f"Готово! Строк в AvP: {len(avp)}")
 
-                    if len(issues["duplicates"]):
-                        st.warning(f"⚠ Дубликаты (Город, СВЗ регион) в result: {len(issues['duplicates'])}")
-                        st.dataframe(issues["duplicates"].head(50), use_container_width=True)
+                if len(issues["no_region"]):
+                    st.warning(f"⚠ СВЗ регион пусто: {len(issues['no_region'])} строк в result")
+                    st.dataframe(issues["no_region"].head(50), use_container_width=True)
 
-                    if len(issues["no_category"]):
-                        st.warning(f"⚠ Не нашли Категория new для: {len(issues['no_category'])} строк AvP")
-                        st.dataframe(issues["no_category"].head(50), use_container_width=True)
+                if len(issues["duplicates"]):
+                    st.warning(f"⚠ Дубликаты (Город, СВЗ регион) в result: {len(issues['duplicates'])}")
+                    st.dataframe(issues["duplicates"].head(50), use_container_width=True)
 
-                    if len(issues["no_expenses"]):
-                        st.warning(f"⚠ Не нашли Расходы на ТП для: {len(issues['no_expenses'])} строк AvP")
-                        st.dataframe(issues["no_expenses"].head(50), use_container_width=True)
+                if len(issues["no_category"]):
+                    st.warning(f"⚠ Не нашли Категория new для: {len(issues['no_category'])} строк AvP")
+                    st.dataframe(issues["no_category"].head(50), use_container_width=True)
 
-                    st.subheader("Предпросмотр AvP")
-                    st.dataframe(avp.head(20), use_container_width=True)
+                if len(issues["no_expenses"]):
+                    st.warning(f"⚠ Не нашли Расходы на ТП для: {len(issues['no_expenses'])} строк AvP")
+                    st.dataframe(issues["no_expenses"].head(50), use_container_width=True)
 
-                    buf_avp = io.BytesIO()
-                    with pd.ExcelWriter(buf_avp, engine="openpyxl") as writer:
-                        avp.to_excel(writer, sheet_name="AvP", index=False)
+                st.subheader("Предпросмотр AvP")
+                st.dataframe(avp.head(20), use_container_width=True)
 
-                    st.download_button(
-                        "⬇ Скачать AvP.xlsx",
-                        buf_avp.getvalue(),
-                        "AvP.xlsx",
-                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    )
+                buf_avp = io.BytesIO()
+                with pd.ExcelWriter(buf_avp, engine="openpyxl") as writer:
+                    avp.to_excel(writer, sheet_name="AvP", index=False)
+
+                st.download_button(
+                    "⬇ Скачать AvP.xlsx",
+                    buf_avp.getvalue(),
+                    "AvP.xlsx",
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
