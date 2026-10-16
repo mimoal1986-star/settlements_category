@@ -100,7 +100,10 @@ CITY_COORDS = {
 
 # ==================== GITHUB API ====================
 def github_get_file(path):
-    """Возвращает (content_bytes, sha) или (None, None)."""
+    """
+    Возвращает (content_bytes, sha) или (None, None).
+    Использует raw media type — работает для файлов до 100 МБ.
+    """
     try:
         cfg = st.secrets["github"]
         token = cfg["token"]
@@ -111,17 +114,36 @@ def github_get_file(path):
         return None, None
 
     url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}"
-    headers = {"Authorization": f"token {token}"}
     params = {"ref": branch}
+
+    # === 1. Raw content (для любого размера) ===
+    headers_raw = {
+        "Authorization": f"token {token}",
+        "Accept": "application/vnd.github.raw",
+    }
+    content = None
     try:
-        r = requests.get(url, headers=headers, params=params, timeout=15)
+        r = requests.get(url, headers=headers_raw, params=params, timeout=60)
         if r.status_code == 200:
-            data = r.json()
-            content = base64.b64decode(data["content"])
-            return content, data["sha"]
+            content = r.content
     except Exception:
         pass
-    return None, None
+
+    if content is None:
+        return None, None
+
+    # === 2. SHA (отдельным JSON-запросом) ===
+    sha = None
+    try:
+        headers_json = {"Authorization": f"token {token}"}
+        r2 = requests.get(url, headers=headers_json, params=params, timeout=15)
+        if r2.status_code == 200:
+            data = r2.json()
+            sha = data.get("sha")
+    except Exception:
+        pass
+
+    return content, sha
 
 
 def github_put_file(path, content_bytes, commit_message):
