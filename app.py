@@ -463,9 +463,9 @@ def build_avp(sx_df, bdr_df, result_df, coeffs, kf_df):
             if not reg:
                 continue
             if col_sl:
-                kf_slozhnosti[reg] = to_float(r[col_sl]) if not pd.isna(to_float(r[col_sl])) else 1.0
+                kf_slozhnosti[reg] = to_float(r[col_sl]) if not pd.isna(to_float(r[col_sl])) else 0.0
             if col_lk:
-                kf_lokal[reg] = to_float(r[col_lk]) if not pd.isna(to_float(r[col_lk])) else 1.0
+                kf_lokal[reg] = to_float(r[col_lk]) if not pd.isna(to_float(r[col_lk])) else 0.0
 
     sx_key_names = ["Client", "Project Name", "Wave Name", "Project Code", "Регион", "Город"]
     sx_cols = {}
@@ -570,11 +570,11 @@ def build_avp(sx_df, bdr_df, result_df, coeffs, kf_df):
 
     def find_kf_slozhnost(row):
         reg = squeeze(row["Region short"]).upper()
-        return kf_slozhnosti.get(reg, 1.0)
-
+        return kf_slozhnosti.get(reg, 0.0)
+    
     def find_kf_lokal(row):
         reg = squeeze(row["Region short"]).upper()
-        return kf_lokal.get(reg, 1.0)
+        return kf_lokal.get(reg, 0.0)
 
     avp["КФ сложности"] = avp.apply(find_kf_slozhnost, axis=1)
     avp["КФ локальной сложности"] = avp.apply(find_kf_lokal, axis=1)
