@@ -15,7 +15,6 @@ COEFFICIENTS_FILE = "coefficients.json"
 
 DEFAULT_COEFFS = {
     "kf_category": {1: 1.0, 2: 1.0, 3: 1.0, 4: 1.0, 5: 1.0, 6: 1.0},
-    "kf_doezd": 1.0,
 }
 
 NEW_COLS = [
@@ -30,7 +29,7 @@ NEW_COLS = [
     "Для НП 6 → НП 5 расстояние",
 ]
 
-FINAL_COLS = ["Город new", "Область new", "Категория new"]
+FINAL_COLS = ["Город new", "Область new", "Категория new", "Категория new с КФ доезда"]
 
 GRAD_TO_CAT = {
     "миллионник": 1,
@@ -104,10 +103,7 @@ def load_coefficients():
                 data = json.load(f)
             cat = data.get("kf_category", {})
             cat = {int(k): float(v) for k, v in cat.items()}
-            return {
-                "kf_category": cat,
-                "kf_doezd": float(data.get("kf_doezd", 1.0)),
-            }
+            return {"kf_category": cat}
         except Exception:
             pass
     save_coefficients(DEFAULT_COEFFS)
@@ -179,7 +175,6 @@ def to_float(v):
 
 
 def parse_percent(v):
-    """'100%' → 1.0, '95%' → 0.95. Если не %, то to_float / 100 при >1."""
     if v is None or is_empty(v):
         return 1.0
     s = str(v).strip()
@@ -198,7 +193,6 @@ def parse_percent(v):
 
 
 def load_kf_file(path):
-    """Загружает KF-файл. Возвращает dict: Region short → коэффициент. Если файла нет — {}."""
     if not os.path.exists(path):
         return {}
     try:
@@ -207,10 +201,8 @@ def load_kf_file(path):
         return {}
     if len(df) < 2:
         return {}
-
     headers = df.iloc[0].tolist()
     values = df.iloc[1].tolist()
-
     result = {}
     for h, v in zip(headers, values):
         h_clean = squeeze(h)
@@ -322,6 +314,7 @@ def compute_city_new(sheet_res):
     sheet_res["Город new"] = None
     sheet_res["Область new"] = None
     sheet_res["Категория new"] = None
+    sheet_res["Категория new с КФ доезда"] = None
 
     city_to_cat = {}
     for _, row in sheet_res.iterrows():
@@ -368,11 +361,22 @@ def compute_city_new(sheet_res):
                 )
             else:
                 cat_new = None
-            sheet_res.at[i, "Категория new"] = cat_new if not is_empty(cat_new) else B_cat
+            cat_new = cat_new if not is_empty(cat_new) else B_cat
         else:
             sheet_res.at[i, "Город new"] = B
             sheet_res.at[i, "Область new"] = B_reg
-            sheet_res.at[i, "Категория new"] = B_cat
+            cat_new = B_cat
+
+        sheet_res.at[i, "Категория new"] = cat_new
+
+        # Категория new с КФ доезда
+        cat_new_f = to_float(cat_new)
+        cat_old_f = to_float(B_cat)
+        if not pd.isna(cat_new_f) and not pd.isna(cat_old_f) and cat_new_f < cat_old_f:
+            cat_with_kf = cat_new_f + 0.5
+        else:
+            cat_with_kf = cat_new_f
+        sheet_res.at[i, "Категория new с КФ доезда"] = cat_with_kf
 
     return sheet_res
 
@@ -405,18 +409,23 @@ def build_avp(sx_df, bdr_df, result_df, coeffs, kf_slozhnosti, kf_lokal):
     if res_city is None or res_region is None:
         raise ValueError("В result нет колонок 'Город' или 'СВЗ регион'")
 
+    res_cat_new = find_col(result_df, "Категория new")
+    res_cat_kf = find_col(result_df, "Категория new с КФ доезда")
+
     bad_region_mask = result_df[res_region].apply(is_empty)
     bad_region = result_df[bad_region_mask][[res_city, res_region]]
     issues["no_region"] = bad_region
 
+    # Словарь: (Город, СВЗ регион) → (Категория new, Категория new с КФ доезда)
     city_cat_map = {}
     dup_rows = []
     for _, r in result_df.iterrows():
         city = squeeze(r[res_city]).lower()
         reg = squeeze(r[res_region]).lower()
-        cat_new = r.get("Категория new")
         if not city or not reg:
             continue
+        cat_new = r.get(res_cat_new)
+        cat_kf = r.get(res_cat_kf)
         key = (city, reg)
         if key in city_cat_map:
             dup_rows.append({
@@ -425,7 +434,7 @@ def build_avp(sx_df, bdr_df, result_df, coeffs, kf_slozhnosti, kf_lokal):
                 "Категория new": cat_new,
             })
             continue
-        city_cat_map[key] = cat_new
+        city_cat_map[key] = (cat_new, cat_kf)
 
     if dup_rows:
         issues["duplicates"] = pd.DataFrame(dup_rows)
@@ -434,10 +443,12 @@ def build_avp(sx_df, bdr_df, result_df, coeffs, kf_slozhnosti, kf_lokal):
         city = squeeze(row["Город"]).lower()
         reg = squeeze(row["Region short"]).lower()
         if not city or not reg:
-            return None
-        return city_cat_map.get((city, reg))
+            return None, None
+        return city_cat_map.get((city, reg), (None, None))
 
-    avp["Категория new"] = avp.apply(find_cat, axis=1)
+    cats_and_kf = avp.apply(find_cat, axis=1)
+    avp["Категория new"] = [t[0] for t in cats_and_kf]
+    avp["_cat_with_kf"] = [t[1] for t in cats_and_kf]
 
     no_cat = avp[avp["Категория new"].apply(is_empty)]
     if len(no_cat):
@@ -468,12 +479,20 @@ def build_avp(sx_df, bdr_df, result_df, coeffs, kf_slozhnosti, kf_lokal):
 
     # === КФ ===
     kf_cat_settings = coeffs["kf_category"]
-    kf_doezd_value = coeffs["kf_doezd"]
 
     avp["КФ категории"] = avp["Категория new"].apply(
         lambda c: kf_cat_settings.get(int(c), 1.0) if not is_empty(c) else 1.0
     )
-    avp["КФ доезда"] = kf_doezd_value
+
+    # КФ доезда = Категория new с КФ доезда − Категория new
+    def calc_kf_doezd(row):
+        c_new = to_float(row["Категория new"])
+        c_kf = to_float(row["_cat_with_kf"])
+        if pd.isna(c_new) or pd.isna(c_kf):
+            return 0.0
+        return round(c_kf - c_new, 2)
+
+    avp["КФ доезда"] = avp.apply(calc_kf_doezd, axis=1)
 
     def find_kf_slozhnost(row):
         reg = squeeze(row["Region short"]).upper()
@@ -486,9 +505,11 @@ def build_avp(sx_df, bdr_df, result_df, coeffs, kf_slozhnosti, kf_lokal):
     avp["КФ сложности"] = avp.apply(find_kf_slozhnost, axis=1)
     avp["КФ локальной сложности"] = avp.apply(find_kf_lokal, axis=1)
 
+    # Новая формула: КФ итог = сумма всех КФ
     avp["КФ итог"] = (
-        (avp["КФ категории"] + avp["КФ доезда"]) *
-        avp["КФ сложности"] *
+        avp["КФ категории"] +
+        avp["КФ доезда"] +
+        avp["КФ сложности"] +
         avp["КФ локальной сложности"]
     ).round(2)
 
@@ -507,9 +528,8 @@ def build_avp(sx_df, bdr_df, result_df, coeffs, kf_slozhnosti, kf_lokal):
            .to_dict()
     )
     avp["Средняя цена проекта"] = avp["_key_tuple"].map(avg_price_map)
-    avp = avp.drop(columns=["_key_tuple"])
+    avp = avp.drop(columns=["_key_tuple", "_cat_with_kf"])
 
-    # Переименование
     rename_map = {
         "Client": "Клиент Имя",
         "Project Name": "Проект Имя",
@@ -676,20 +696,8 @@ with st.sidebar:
         )
         new_kf_cat[cat] = round(val, 2)
 
-    st.markdown("### КФ доезда")
-    new_kf_doezd = st.slider(
-        "КФ доезда",
-        min_value=0.0, max_value=1.0, step=0.05,
-        value=float(st.session_state["coeffs"]["kf_doezd"]),
-        key="kf_doezd_slider"
-    )
-    new_kf_doezd = round(new_kf_doezd, 2)
-
-    if (new_kf_cat != kf_cat) or (new_kf_doezd != st.session_state["coeffs"]["kf_doezd"]):
-        st.session_state["coeffs"] = {
-            "kf_category": new_kf_cat,
-            "kf_doezd": new_kf_doezd,
-        }
+    if new_kf_cat != kf_cat:
+        st.session_state["coeffs"] = {"kf_category": new_kf_cat}
         save_coefficients(st.session_state["coeffs"])
 
     st.markdown("---")
@@ -733,7 +741,6 @@ user_file = st.file_uploader(
     key="user_file"
 )
 
-# === Справочник НП ===
 spravochnik_exists = os.path.exists(SPRAVOCHNIK_FILE)
 if spravochnik_exists:
     st.markdown("### 2. Справочник НП")
@@ -755,7 +762,6 @@ else:
             st.success(f"Сохранено в `{SPRAVOCHNIK_FILE}`")
             st.rerun()
 
-# === КФ сложности (необязательно) ===
 if not os.path.exists(KF_SLOZHNOSTI_FILE):
     st.markdown("### 3. (Необязательно) Загрузите файл КФ сложности")
     st.caption("Если не загрузить — КФ сложности = 1 для всех регионов.")
@@ -778,7 +784,6 @@ if not os.path.exists(KF_SLOZHNOSTI_FILE):
             st.success(f"Сохранено в `{KF_SLOZHNOSTI_FILE}`")
             st.rerun()
 
-# === КФ локальной (необязательно) ===
 if not os.path.exists(KF_LOKAL_FILE):
     st.markdown("### 4. (Необязательно) Загрузите файл КФ локальной сложности")
     st.caption("Если не загрузить — КФ локальной = 1 для всех регионов.")
@@ -801,7 +806,6 @@ if not os.path.exists(KF_LOKAL_FILE):
             st.success(f"Сохранено в `{KF_LOKAL_FILE}`")
             st.rerun()
 
-# === БДР и СХ ===
 st.markdown("### 5. (Необязательно) Загрузите БДР")
 bdr_file = st.file_uploader(
     "БДР (колонки: КОД, Расходы на ТП/Респонденты (план на 1 ед.))",
@@ -816,7 +820,6 @@ sx_file = st.file_uploader(
     key="sx_file"
 )
 
-# === Основной блок ===
 ds_df = st.session_state.get("ds_df", None)
 
 if user_file and ds_df is not None:
@@ -962,7 +965,6 @@ if user_file and ds_df is not None:
                     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 )
 
-        # === Кнопка AvP ===
         can_build_avp = (
             bdr_file is not None and
             sx_file is not None and
