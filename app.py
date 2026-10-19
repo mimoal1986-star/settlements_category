@@ -433,6 +433,10 @@ def compute_city_new(sheet_res):
 
 # ==================== AVP ====================
 def build_avp(sx_df, result_df, coeffs, kf_df, avg_price_input):
+    """
+    Возвращает (avp, issues, t1, t2).
+    t1, t2 — сводные таблицы (до final_order).
+    """
     issues = {
         "no_region": pd.DataFrame(),
         "duplicates": pd.DataFrame(),
@@ -580,6 +584,20 @@ def build_avp(sx_df, result_df, coeffs, kf_df, avg_price_input):
         (avp["Цена анкеты"] - avp["Ср цена в поля"]) / avp["Ср цена в поля"] * 100
     ).round(2)
 
+    # === СВОДНЫЕ ТАБЛИЦЫ (до final_order) ===
+    total_quota = avp["Кол-во анкет"].sum()
+
+    t1 = avp.groupby("Категория new")["Кол-во анкет"].sum().reset_index()
+    t1.columns = ["Категория", "Квота (кол-во анкет)"]
+    t1["% от общей квоты"] = (t1["Квота (кол-во анкет)"] / total_quota * 100).round(2)
+    t1 = t1.sort_values("Категория").reset_index(drop=True)
+
+    t2 = avp.groupby("_cat_with_kf")["Кол-во анкет"].sum().reset_index()
+    t2.columns = ["Категория", "Квота (кол-во анкет)"]
+    t2["% от общей квоты"] = (t2["Квота (кол-во анкет)"] / total_quota * 100).round(2)
+    t2 = t2.sort_values("Категория").reset_index(drop=True)
+
+    # === ПЕРЕИМЕНОВАНИЕ И ФИНАЛЬНЫЙ ПОРЯДОК ===
     rename_map = {
         "Client": "Клиент Имя",
         "Project Name": "Проект Имя",
@@ -599,7 +617,7 @@ def build_avp(sx_df, result_df, coeffs, kf_df, avg_price_input):
     ]
     avp = avp[[c for c in final_order if c in avp.columns]]
 
-    return avp, issues
+    return avp, issues, t1, t2
 
 
 # ==================== ГЕОМЕТРИЯ ====================
@@ -888,9 +906,8 @@ with tab_main:
     ds_df = st.session_state.get("ds_df", None)
 
     if user_file and ds_df is not None:
-        # === Кнопка 1: Рассчитать Категории new ===
         if st.button("1️⃣ Рассчитать Категории new"):
-            for k in ["matched", "result_sheet", "avp", "avp_issues"]:
+            for k in ["matched", "result_sheet", "avp", "avp_issues", "avp_t1", "avp_t2"]:
                 if k in st.session_state:
                     del st.session_state[k]
 
@@ -912,7 +929,6 @@ with tab_main:
                 with st.spinner("Сопоставляем..."):
                     matched = match_settlements(user_df, ds_df)
 
-                # Расчёт расстояний
                 work = matched.copy()
                 user_df_saved = user_df
 
@@ -987,7 +1003,6 @@ with tab_main:
 
                 st.session_state["result_sheet"] = sheet_res
 
-                # === Статистика текстом ===
                 stats = matched["match_status"].value_counts()
                 st.success("✅ Категории рассчитаны")
                 for status, count in stats.items():
@@ -1024,49 +1039,40 @@ with tab_main:
                         kf_df = st.session_state.get("kf_df", None)
 
                         try:
-                            avp, issues = build_avp(
+                            avp, issues, t1, t2 = build_avp(
                                 sx_df, result_df,
                                 coeffs, kf_df, avg_price_input
                             )
                             st.session_state["avp"] = avp
                             st.session_state["avp_issues"] = issues
+                            st.session_state["avp_t1"] = t1
+                            st.session_state["avp_t2"] = t2
                         except ValueError as e:
                             st.error(f"Ошибка: {e}")
                             avp = None
 
                 if "avp" in st.session_state:
                     avp = st.session_state["avp"]
-                    issues = st.session_state["avp_issues"]
+                    t1 = st.session_state.get("avp_t1")
+                    t2 = st.session_state.get("avp_t2")
 
                     st.success(f"✅ AvP рассчитан: {len(avp)} строк")
 
-                    # === Сводные таблицы ===
                     st.markdown("## Сводные таблицы")
-
-                    total_quota = avp["Кол-во анкет"].sum()
-
-                    # Таблица 1: по категориям
-                    t1 = avp.groupby("Категория new")["Кол-во анкет"].sum().reset_index()
-                    t1.columns = ["Категория", "Квота (кол-во анкет)"]
-                    t1["% от общей квоты"] = (t1["Квота (кол-во анкет)"] / total_quota * 100).round(2)
-                    t1 = t1.sort_values("Категория")
-
-                    # Таблица 2: по категориям с КФ доезда
-                    avp["_cat_with_kf_display"] = avp["_cat_with_kf"]
-                    t2 = avp.groupby("_cat_with_kf_display")["Кол-во анкет"].sum().reset_index()
-                    t2.columns = ["Категория", "Квота (кол-во анкет)"]
-                    t2["% от общей квоты"] = (t2["Квота (кол-во анкет)"] / total_quota * 100).round(2)
-                    t2 = t2.sort_values("Категория")
-
                     col1, col2 = st.columns(2)
                     with col1:
                         st.markdown("### По категориям")
-                        st.dataframe(t1, use_container_width=True, hide_index=True)
+                        if t1 is not None and len(t1):
+                            st.dataframe(t1, use_container_width=True, hide_index=True)
+                        else:
+                            st.info("Нет данных")
                     with col2:
                         st.markdown("### По категориям с КФ доезда")
-                        st.dataframe(t2, use_container_width=True, hide_index=True)
+                        if t2 is not None and len(t2):
+                            st.dataframe(t2, use_container_width=True, hide_index=True)
+                        else:
+                            st.info("Нет данных")
 
-                    # === Скачивание AvP ===
                     buf_avp = io.BytesIO()
                     with pd.ExcelWriter(buf_avp, engine="openpyxl") as writer:
                         avp.to_excel(writer, sheet_name="AvP", index=False)
