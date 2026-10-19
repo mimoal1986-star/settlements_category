@@ -431,19 +431,15 @@ def compute_city_new(sheet_res):
     return sheet_res
 
 
-# ==================== AVP (новая логика) ====================
+# ==================== AVP ====================
 def build_avp(sx_df, result_df, coeffs, kf_df, avg_price_input):
-    """
-    Новая логика: от Ср. цены в поля → Цена анкеты по городам.
-    БДР не используется.
-    """
     issues = {
         "no_region": pd.DataFrame(),
         "duplicates": pd.DataFrame(),
         "no_category": pd.DataFrame(),
     }
 
-    # KF: dict Region short → (кф_сложности, кф_локальной)
+    # KF
     kf_slozhnosti = {}
     kf_lokal = {}
     if kf_df is not None and len(kf_df) > 0:
@@ -479,13 +475,10 @@ def build_avp(sx_df, result_df, coeffs, kf_df, avg_price_input):
             raise ValueError(f"В СХ нет колонки: {name}")
         sx_cols[name] = col
 
-    # Уникальные связки + количество анкет
     sx_selected = sx_df[[sx_cols[k] for k in sx_key_names] + [sx_cols["Region short"]]].copy()
     sx_selected.columns = sx_key_names + ["Region short"]
 
-    # Считаем количество анкет для каждой связки
     counts = sx_selected.groupby(sx_key_names + ["Region short"]).size().reset_index(name="Кол-во анкет")
-
     avp = counts.copy()
 
     # Мапа (Город, Region short) → (Категория new, Категория new с КФ доезда)
@@ -538,14 +531,12 @@ def build_avp(sx_df, result_df, coeffs, kf_df, avg_price_input):
     if len(no_cat):
         issues["no_category"] = no_cat[sx_key_names + ["Region short"]]
 
-    # КФ категории
     kf_cat_settings = coeffs["kf_category"]
 
     avp["КФ категории"] = avp["Категория new"].apply(
         lambda c: kf_cat_settings.get(int(c), 0.0) if not is_empty(c) else 0.0
     )
 
-    # КФ доезда = Категория new с КФ доезда − Категория new
     def calc_kf_doezd(row):
         c_new = to_float(row["Категория new"])
         c_kf = to_float(row["_cat_with_kf"])
@@ -573,8 +564,7 @@ def build_avp(sx_df, result_df, coeffs, kf_df, avg_price_input):
         avp["КФ локальной сложности"]
     ).round(4)
 
-    # === Расчёт X ===
-    # X = Ср. цена × Σ(кол-во) / Σ(КФ итог × кол-во)
+    # X
     total_count = avp["Кол-во анкет"].sum()
     weighted_sum = (avp["КФ итог"] * avp["Кол-во анкет"]).sum()
 
@@ -583,11 +573,9 @@ def build_avp(sx_df, result_df, coeffs, kf_df, avg_price_input):
 
     X = avg_price_input * total_count / weighted_sum
 
-    # Цена анкеты = КФ итог × X
     avp["Ср цена в поля"] = avg_price_input
     avp["Цена анкеты"] = (avp["КФ итог"] * X).round(2)
 
-    # Дельты
     avp["△ Цена анкеты - Ср цена в поля, руб"] = (
         avp["Цена анкеты"] - avp["Ср цена в поля"]
     ).round(2)
@@ -596,7 +584,6 @@ def build_avp(sx_df, result_df, coeffs, kf_df, avg_price_input):
         (avp["Цена анкеты"] - avp["Ср цена в поля"]) / avp["Ср цена в поля"] * 100
     ).round(2)
 
-    # Переименование
     rename_map = {
         "Client": "Клиент Имя",
         "Project Name": "Проект Имя",
@@ -605,7 +592,6 @@ def build_avp(sx_df, result_df, coeffs, kf_df, avg_price_input):
     }
     avp = avp.rename(columns=rename_map)
 
-    # Финальный порядок
     final_order = [
         "Клиент Имя", "Проект Имя", "Волна Имя", "Проект Код",
         "Регион", "Город", "Region short",
@@ -731,13 +717,23 @@ def match_settlements(user_df, ds_df):
 
 def read_any(f):
     raw = f.read()
-    if f.name.lower().endswith(".csv"):
+    name = f.name.lower()
+
+    if name.endswith(".csv"):
         try:
             df = pd.read_csv(io.BytesIO(raw), encoding="utf-8-sig")
         except (UnicodeDecodeError, UnicodeError):
             df = pd.read_csv(io.BytesIO(raw), encoding="cp1251")
     else:
-        df = pd.read_excel(io.BytesIO(raw), sheet_name=0)
+        try:
+            df = pd.read_excel(io.BytesIO(raw), sheet_name=0)
+        except Exception:
+            # Fallback: пробуем CSV
+            try:
+                df = pd.read_csv(io.BytesIO(raw), encoding="utf-8-sig")
+            except Exception:
+                df = pd.read_csv(io.BytesIO(raw), encoding="cp1251")
+
     df = df.loc[:, ~df.columns.duplicated()]
     return df
 
@@ -1051,66 +1047,55 @@ with tab_main:
                         reasons.append("не введена Ср. цена в поля (блок 2)")
                     st.info(f"Кнопка «Рассчитать ср. цену анкеты» станет доступна, когда: {', '.join(reasons)}")
                 else:
-                    # Проверка одного проекта
-                    sx_df_tmp = read_any(sx_file)
-                    if "Project Code" in sx_df_tmp.columns:
-                        unique_projects = sx_df_tmp["Project Code"].dropna().astype(str).str.strip().unique()
-                        unique_projects = [p for p in unique_projects if p]
-                        if len(unique_projects) > 1:
-                            st.error(f"❌ В СХ найдено {len(unique_projects)} проектов. Выбери 1 проект. Найдено: {unique_projects[:5]}")
-                            can_build_avp = False
+                    if st.button("3️⃣ Рассчитать ср. цену анкеты"):
+                        with st.spinner("Считаем AvP..."):
+                            sx_df = read_any(sx_file)
+                            result_df = st.session_state["result_sheet"]
+                            coeffs = st.session_state["coeffs"]
+                            kf_df = st.session_state.get("kf_df", None)
 
-                    if can_build_avp:
-                        if st.button("3️⃣ Рассчитать ср. цену анкеты"):
-                            with st.spinner("Считаем AvP..."):
-                                bdr_df = None  # БДР не используется
-                                sx_df = read_any(sx_file)
-                                result_df = st.session_state["result_sheet"]
-                                coeffs = st.session_state["coeffs"]
-                                kf_df = st.session_state.get("kf_df", None)
+                            try:
+                                avp, issues = build_avp(
+                                    sx_df, result_df,
+                                    coeffs, kf_df, avg_price_input
+                                )
+                                st.session_state["avp"] = avp
+                                st.session_state["avp_issues"] = issues
+                            except ValueError as e:
+                                st.error(f"Ошибка: {e}")
+                                avp = None
 
-                                try:
-                                    avp, issues = build_avp(
-                                        sx_df, result_df,
-                                        coeffs, kf_df, avg_price_input
-                                    )
-                                    st.session_state["avp"] = avp
-                                    st.session_state["avp_issues"] = issues
-                                except ValueError as e:
-                                    st.error(f"Ошибка: {e}")
-                                    avp = None
+                    if "avp" in st.session_state:
+                        avp = st.session_state["avp"]
+                        issues = st.session_state["avp_issues"]
 
-                        if "avp" in st.session_state:
-                            avp = st.session_state["avp"]
-                            issues = st.session_state["avp_issues"]
+                        st.success(f"Готово! Строк в AvP: {len(avp)}")
 
-                            st.success(f"Готово! Строк в AvP: {len(avp)}")
+                        if len(issues["no_region"]):
+                            st.warning(f"⚠ СВЗ регион пусто: {len(issues['no_region'])} строк в result")
+                            st.dataframe(issues["no_region"].head(50), use_container_width=True)
 
-                            if len(issues["no_region"]):
-                                st.warning(f"⚠ СВЗ регион пусто: {len(issues['no_region'])} строк в result")
-                                st.dataframe(issues["no_region"].head(50), use_container_width=True)
+                        if len(issues["duplicates"]):
+                            st.warning(f"⚠ Дубликаты (Город, СВЗ регион) в result: {len(issues['duplicates'])}")
+                            st.dataframe(issues["duplicates"].head(50), use_container_width=True)
 
-                            if len(issues["duplicates"]):
-                                st.warning(f"⚠ Дубликаты (Город, СВЗ регион) в result: {len(issues['duplicates'])}")
-                                st.dataframe(issues["duplicates"].head(50), use_container_width=True)
+                        if len(issues["no_category"]):
+                            st.warning(f"⚠ Не нашли Категория new: {len(issues['no_category'])} строк")
+                            st.dataframe(issues["no_category"].head(50), use_container_width=True)
 
-                            if len(issues["no_category"]):
-                                st.warning(f"⚠ Не нашли Категория new: {len(issues['no_category'])} строк")
-                                st.dataframe(issues["no_category"].head(50), use_container_width=True)
+                        st.subheader("Предпросмотр AvP")
+                        st.dataframe(avp.head(20), use_container_width=True)
 
-                            st.subheader("Предпросмотр AvP")
-                            st.dataframe(avp.head(20), use_container_width=True)
+                        buf_avp = io.BytesIO()
+                        with pd.ExcelWriter(buf_avp, engine="openpyxl") as writer:
+                            avp.to_excel(writer, sheet_name="AvP", index=False)
 
-                            buf_avp = io.BytesIO()
-                            with pd.ExcelWriter(buf_avp, engine="openpyxl") as writer:
-                                avp.to_excel(writer, sheet_name="AvP", index=False)
-
-                            st.download_button(
-                                "⬇ Скачать AvP.xlsx",
-                                buf_avp.getvalue(),
-                                "AvP.xlsx",
-                                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                            )
+                        st.download_button(
+                            "⬇ Скачать AvP.xlsx",
+                            buf_avp.getvalue(),
+                            "AvP.xlsx",
+                            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        )
     else:
         if not user_file:
             st.info("Загрузите список НП (блок 1).")
