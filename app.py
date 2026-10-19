@@ -439,7 +439,6 @@ def build_avp(sx_df, result_df, coeffs, kf_df, avg_price_input):
         "no_category": pd.DataFrame(),
     }
 
-    # KF
     kf_slozhnosti = {}
     kf_lokal = {}
     if kf_df is not None and len(kf_df) > 0:
@@ -457,7 +456,6 @@ def build_avp(sx_df, result_df, coeffs, kf_df, avg_price_input):
                 v = to_float(r[col_lk])
                 kf_lokal[reg] = v if not pd.isna(v) else 0.0
 
-    # Проверка «один проект»
     if "Project Code" in sx_df.columns:
         unique_projects = sx_df["Project Code"].dropna().astype(str).str.strip().unique()
         unique_projects = [p for p in unique_projects if p]
@@ -481,7 +479,6 @@ def build_avp(sx_df, result_df, coeffs, kf_df, avg_price_input):
     counts = sx_selected.groupby(sx_key_names + ["Region short"]).size().reset_index(name="Кол-во анкет")
     avp = counts.copy()
 
-    # Мапа (Город, Region short) → (Категория new, Категория new с КФ доезда)
     res_city = find_col(result_df, "Город")
     res_region = find_col(result_df, "СВЗ регион")
     if res_city is None or res_region is None:
@@ -564,7 +561,6 @@ def build_avp(sx_df, result_df, coeffs, kf_df, avg_price_input):
         avp["КФ локальной сложности"]
     ).round(4)
 
-    # X
     total_count = avp["Кол-во анкет"].sum()
     weighted_sum = (avp["КФ итог"] * avp["Кол-во анкет"]).sum()
 
@@ -722,13 +718,15 @@ def read_any(f):
     if name.endswith(".csv"):
         try:
             df = pd.read_csv(io.BytesIO(raw), encoding="utf-8-sig")
-        except (UnicodeDecodeError, UnicodeError):
-            df = pd.read_csv(io.BytesIO(raw), encoding="cp1251")
+        except Exception:
+            try:
+                df = pd.read_csv(io.BytesIO(raw), encoding="cp1251")
+            except Exception:
+                df = pd.read_excel(io.BytesIO(raw), sheet_name=0)
     else:
         try:
             df = pd.read_excel(io.BytesIO(raw), sheet_name=0)
         except Exception:
-            # Fallback: пробуем CSV
             try:
                 df = pd.read_csv(io.BytesIO(raw), encoding="utf-8-sig")
             except Exception:
@@ -866,7 +864,7 @@ with tab_main:
         key="user_file"
     )
 
-    st.markdown("### 2. Введите среднюю цену в поля (обязательно)")
+    st.markdown("### 2. Введите среднюю цену в поля")
     avg_price_input = st.number_input(
         "Ср. цена в поля, руб",
         min_value=0.0,
@@ -876,9 +874,13 @@ with tab_main:
         key="avg_price_input"
     )
 
-    st.markdown("### 3. (Необязательно) Загрузите СХ")
+    st.markdown("### 3. Загрузите проект")
+    st.caption(
+        "Обязательные колонки: Client, Project Name, Wave Name, Project Code, "
+        "Регион, Город, Region short"
+    )
     sx_file = st.file_uploader(
-        "СХ (колонки: Client, Project Name, Wave Name, Project Code, Регион, Город, Region short)",
+        "СХ проекта (Excel)",
         type=["xlsx", "xls", "csv"],
         key="sx_file"
     )
@@ -886,216 +888,195 @@ with tab_main:
     ds_df = st.session_state.get("ds_df", None)
 
     if user_file and ds_df is not None:
-        user_df_raw = clean_dataframe(read_any(user_file))
-        user_df = remove_duplicates(user_df_raw)
+        # === Кнопка 1: Рассчитать Категории new ===
+        if st.button("1️⃣ Рассчитать Категории new"):
+            for k in ["matched", "result_sheet", "avp", "avp_issues"]:
+                if k in st.session_state:
+                    del st.session_state[k]
 
-        st.subheader("Ваш список")
-        st.dataframe(user_df_raw.head(5), use_container_width=True)
-        st.caption(f"Строк: {len(user_df_raw)}")
+            user_df_raw = clean_dataframe(read_any(user_file))
+            user_df = remove_duplicates(user_df_raw)
 
-        required_user = ["Тип НП", "Город", "Широта", "Долгота", "Население",
-                         "Градация", "Категория", "Область", "ФО", "СВЗ регион"]
-        required_ds = ["settlement", "region", "latitude_dd", "longitude_dd"]
+            required_user = ["Тип НП", "Город", "Широта", "Долгота", "Население",
+                             "Градация", "Категория", "Область", "ФО", "СВЗ регион"]
+            required_ds = ["settlement", "region", "latitude_dd", "longitude_dd"]
 
-        missing_user = [c for c in required_user if c not in user_df_raw.columns]
-        missing_ds = [c for c in required_ds if c not in ds_df.columns]
+            missing_user = [c for c in required_user if c not in user_df_raw.columns]
+            missing_ds = [c for c in required_ds if c not in ds_df.columns]
 
-        if missing_user:
-            st.error(f"В вашем файле нет колонок: {missing_user}")
-        if missing_ds:
-            st.error(f"В справочнике нет колонок: {missing_ds}")
-
-        if not missing_user and not missing_ds:
-            if st.button("1️⃣ Сопоставить"):
-                for k in ["matched", "result_sheet", "avp", "avp_issues"]:
-                    if k in st.session_state:
-                        del st.session_state[k]
-
+            if missing_user:
+                st.error(f"В вашем файле нет колонок: {missing_user}")
+            elif missing_ds:
+                st.error(f"В справочнике нет колонок: {missing_ds}")
+            else:
                 with st.spinner("Сопоставляем..."):
                     matched = match_settlements(user_df, ds_df)
 
-                st.session_state["matched"] = matched
-                st.session_state["user_df"] = user_df
+                # Расчёт расстояний
+                work = matched.copy()
+                user_df_saved = user_df
 
-                stats = matched["match_status"].value_counts().reset_index()
-                stats.columns = ["статус", "количество"]
-                st.success("Готово")
-                st.write("**Статусы:**")
-                st.dataframe(stats, use_container_width=True)
+                work["_name_orig"] = work["Город"].astype(str).str.strip()
+                work["_region_orig"] = work["Область"].astype(str).str.strip()
+                work["_cat"] = pd.to_numeric(work["Категория"], errors="coerce")
 
-                matched_cat_filled = ~matched["Категория"].apply(is_empty)
-                nf_preview = matched[
-                    ~(
-                        matched["match_status"].isin(["из исходника", "из словаря", "из справочника"]) &
-                        matched_cat_filled
-                    )
-                ]
-                if len(nf_preview):
-                    st.warning(f"Не в «Результат»: {len(nf_preview)} НП")
-                    st.dataframe(
-                        nf_preview[["Город", "Область", "match_status", "Категория"]].head(50),
-                        use_container_width=True
-                    )
+                work["lat"] = work["Широта"].apply(to_float)
+                work["lon"] = work["Долгота"].apply(to_float)
+                has_coords = work["lat"].notna() & work["lon"].notna()
 
-                st.subheader("Предпросмотр")
-                st.dataframe(matched.head(20), use_container_width=True)
+                def sub(cats):
+                    return work[has_coords & work["_cat"].isin(cats)].copy()
 
-            if "matched" in st.session_state:
-                if st.button("2️⃣ Рассчитать и получить Excel"):
-                    for k in ["result_sheet", "avp", "avp_issues"]:
-                        if k in st.session_state:
-                            del st.session_state[k]
+                g12 = sub([1, 2])
+                g34 = sub([3, 4])
+                g5  = sub([5])
+                g3456 = sub([3, 4, 5, 6])
+                g56   = sub([5, 6])
+                g6    = sub([6])
 
-                    work = st.session_state["matched"].copy()
-                    user_df_saved = st.session_state.get("user_df", user_df)
+                for c in NEW_COLS:
+                    work[c] = None
 
-                    work["_name_orig"] = work["Город"].astype(str).str.strip()
-                    work["_region_orig"] = work["Область"].astype(str).str.strip()
-                    work["_cat"] = pd.to_numeric(work["Категория"], errors="coerce")
+                if len(g3456) and len(g12):
+                    names, regions, dists = find_nearest(g3456, g12)
+                    work.loc[g3456.index, "Для НП 3-6 → НП 1, 2 Имя НП"] = names
+                    work.loc[g3456.index, "Для НП 3-6 → НП 1, 2 Область"] = regions
+                    work.loc[g3456.index, "Для НП 3-6 → НП 1, 2 расстояние"] = np.round(dists, 2)
 
-                    work["lat"] = work["Широта"].apply(to_float)
-                    work["lon"] = work["Долгота"].apply(to_float)
-                    has_coords = work["lat"].notna() & work["lon"].notna()
+                if len(g56) and len(g34):
+                    names, regions, dists = find_nearest(g56, g34)
+                    work.loc[g56.index, "Для НП 5-6 → НП 3, 4 Имя НП"] = names
+                    work.loc[g56.index, "Для НП 5-6 → НП 3, 4 Область"] = regions
+                    work.loc[g56.index, "Для НП 5-6 → НП 3, 4 расстояние"] = np.round(dists, 2)
 
-                    def sub(cats):
-                        return work[has_coords & work["_cat"].isin(cats)].copy()
+                if len(g6) and len(g5):
+                    names, regions, dists = find_nearest(g6, g5)
+                    work.loc[g6.index, "Для НП 6 → НП 5 Имя НП"] = names
+                    work.loc[g6.index, "Для НП 6 → НП 5 Область"] = regions
+                    work.loc[g6.index, "Для НП 6 → НП 5 расстояние"] = np.round(dists, 2)
 
-                    g12 = sub([1, 2])
-                    g34 = sub([3, 4])
-                    g5  = sub([5])
-                    g3456 = sub([3, 4, 5, 6])
-                    g56   = sub([5, 6])
-                    g6    = sub([6])
-
-                    for c in NEW_COLS:
-                        work[c] = None
-
-                    if len(g3456) and len(g12):
-                        names, regions, dists = find_nearest(g3456, g12)
-                        work.loc[g3456.index, "Для НП 3-6 → НП 1, 2 Имя НП"] = names
-                        work.loc[g3456.index, "Для НП 3-6 → НП 1, 2 Область"] = regions
-                        work.loc[g3456.index, "Для НП 3-6 → НП 1, 2 расстояние"] = np.round(dists, 2)
-
-                    if len(g56) and len(g34):
-                        names, regions, dists = find_nearest(g56, g34)
-                        work.loc[g56.index, "Для НП 5-6 → НП 3, 4 Имя НП"] = names
-                        work.loc[g56.index, "Для НП 5-6 → НП 3, 4 Область"] = regions
-                        work.loc[g56.index, "Для НП 5-6 → НП 3, 4 расстояние"] = np.round(dists, 2)
-
-                    if len(g6) and len(g5):
-                        names, regions, dists = find_nearest(g6, g5)
-                        work.loc[g6.index, "Для НП 6 → НП 5 Имя НП"] = names
-                        work.loc[g6.index, "Для НП 6 → НП 5 Область"] = regions
-                        work.loc[g6.index, "Для НП 6 → НП 5 расстояние"] = np.round(dists, 2)
-
-                    cat_filled = ~work["Категория"].apply(is_empty)
-                    in_result = (
-                        work["match_status"].isin(["из исходника", "из словаря", "из справочника"]) &
-                        cat_filled
-                    )
-
-                    sheet_res = work[in_result].copy()
-                    orig_cols = [c for c in user_df_saved.columns if c in sheet_res.columns]
-                    sheet_res = sheet_res[orig_cols + ["match_status"] + NEW_COLS]
-
-                    sheet_res = final_dedup(sheet_res)
-                    sheet_res = compute_city_new(sheet_res)
-                    sheet_res["Категория new"] = pd.to_numeric(
-                        sheet_res["Категория new"], errors="coerce"
-                    )
-
-                    sheet_res = sheet_res[
-                        orig_cols + ["match_status"] + NEW_COLS + FINAL_COLS
-                    ]
-
-                    sheet_nf = work[~in_result].copy()
-                    nf_cols = [c for c in user_df_saved.columns if c in sheet_nf.columns]
-                    sheet_nf = sheet_nf[nf_cols + ["match_status"]]
-
-                    buf = io.BytesIO()
-                    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-                        sheet_res.to_excel(writer, sheet_name="Результат", index=False)
-                        if len(sheet_nf):
-                            sheet_nf.to_excel(writer, sheet_name="Не_найдено", index=False)
-
-                    st.session_state["result_sheet"] = sheet_res
-
-                    st.success("Готово!")
-                    st.download_button(
-                        "⬇ Скачать result.xlsx",
-                        buf.getvalue(),
-                        "result.xlsx",
-                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    )
-
-                # === Кнопка AvP ===
-                can_build_avp = (
-                    sx_file is not None and
-                    "result_sheet" in st.session_state and
-                    avg_price_input is not None and
-                    avg_price_input > 0
+                cat_filled = ~work["Категория"].apply(is_empty)
+                in_result = (
+                    work["match_status"].isin(["из исходника", "из словаря", "из справочника"]) &
+                    cat_filled
                 )
 
-                st.markdown("---")
-                if not can_build_avp:
-                    reasons = []
-                    if sx_file is None:
-                        reasons.append("не загружен СХ")
-                    if "result_sheet" not in st.session_state:
-                        reasons.append("не выполнен расчёт категорий (кнопка 2️⃣)")
-                    if avg_price_input is None or avg_price_input <= 0:
-                        reasons.append("не введена Ср. цена в поля (блок 2)")
-                    st.info(f"Кнопка «Рассчитать ср. цену анкеты» станет доступна, когда: {', '.join(reasons)}")
-                else:
-                    if st.button("3️⃣ Рассчитать ср. цену анкеты"):
-                        with st.spinner("Считаем AvP..."):
-                            sx_df = read_any(sx_file)
-                            result_df = st.session_state["result_sheet"]
-                            coeffs = st.session_state["coeffs"]
-                            kf_df = st.session_state.get("kf_df", None)
+                sheet_res = work[in_result].copy()
+                orig_cols = [c for c in user_df_saved.columns if c in sheet_res.columns]
+                sheet_res = sheet_res[orig_cols + ["match_status"] + NEW_COLS]
 
-                            try:
-                                avp, issues = build_avp(
-                                    sx_df, result_df,
-                                    coeffs, kf_df, avg_price_input
-                                )
-                                st.session_state["avp"] = avp
-                                st.session_state["avp_issues"] = issues
-                            except ValueError as e:
-                                st.error(f"Ошибка: {e}")
-                                avp = None
+                sheet_res = final_dedup(sheet_res)
+                sheet_res = compute_city_new(sheet_res)
+                sheet_res["Категория new"] = pd.to_numeric(
+                    sheet_res["Категория new"], errors="coerce"
+                )
 
-                    if "avp" in st.session_state:
-                        avp = st.session_state["avp"]
-                        issues = st.session_state["avp_issues"]
+                sheet_res = sheet_res[
+                    orig_cols + ["match_status"] + NEW_COLS + FINAL_COLS
+                ]
 
-                        st.success(f"Готово! Строк в AvP: {len(avp)}")
+                sheet_nf = work[~in_result].copy()
+                nf_cols = [c for c in user_df_saved.columns if c in sheet_nf.columns]
+                sheet_nf = sheet_nf[nf_cols + ["match_status"]]
 
-                        if len(issues["no_region"]):
-                            st.warning(f"⚠ СВЗ регион пусто: {len(issues['no_region'])} строк в result")
-                            st.dataframe(issues["no_region"].head(50), use_container_width=True)
+                buf = io.BytesIO()
+                with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+                    sheet_res.to_excel(writer, sheet_name="Результат", index=False)
+                    if len(sheet_nf):
+                        sheet_nf.to_excel(writer, sheet_name="Не_найдено", index=False)
 
-                        if len(issues["duplicates"]):
-                            st.warning(f"⚠ Дубликаты (Город, СВЗ регион) в result: {len(issues['duplicates'])}")
-                            st.dataframe(issues["duplicates"].head(50), use_container_width=True)
+                st.session_state["result_sheet"] = sheet_res
 
-                        if len(issues["no_category"]):
-                            st.warning(f"⚠ Не нашли Категория new: {len(issues['no_category'])} строк")
-                            st.dataframe(issues["no_category"].head(50), use_container_width=True)
+                # === Статистика текстом ===
+                stats = matched["match_status"].value_counts()
+                st.success("✅ Категории рассчитаны")
+                for status, count in stats.items():
+                    st.caption(f"• {status}: {count}")
 
-                        st.subheader("Предпросмотр AvP")
-                        st.dataframe(avp.head(20), use_container_width=True)
+                st.download_button(
+                    "⬇ Скачать result.xlsx",
+                    buf.getvalue(),
+                    "result.xlsx",
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
 
-                        buf_avp = io.BytesIO()
-                        with pd.ExcelWriter(buf_avp, engine="openpyxl") as writer:
-                            avp.to_excel(writer, sheet_name="AvP", index=False)
+        # === Кнопка 2: Рассчитать ср. цену анкеты ===
+        if "result_sheet" in st.session_state:
+            can_build_avp = (
+                sx_file is not None and
+                avg_price_input is not None and
+                avg_price_input > 0
+            )
 
-                        st.download_button(
-                            "⬇ Скачать AvP.xlsx",
-                            buf_avp.getvalue(),
-                            "AvP.xlsx",
-                            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        )
+            if not can_build_avp:
+                reasons = []
+                if sx_file is None:
+                    reasons.append("не загружен проект (СХ)")
+                if avg_price_input is None or avg_price_input <= 0:
+                    reasons.append("не введена Ср. цена в поля (блок 2)")
+                st.info(f"Кнопка «Рассчитать ср. цену анкеты» станет доступна, когда: {', '.join(reasons)}")
+            else:
+                if st.button("2️⃣ Рассчитать ср. цену анкеты"):
+                    with st.spinner("Считаем AvP..."):
+                        sx_df = read_any(sx_file)
+                        result_df = st.session_state["result_sheet"]
+                        coeffs = st.session_state["coeffs"]
+                        kf_df = st.session_state.get("kf_df", None)
+
+                        try:
+                            avp, issues = build_avp(
+                                sx_df, result_df,
+                                coeffs, kf_df, avg_price_input
+                            )
+                            st.session_state["avp"] = avp
+                            st.session_state["avp_issues"] = issues
+                        except ValueError as e:
+                            st.error(f"Ошибка: {e}")
+                            avp = None
+
+                if "avp" in st.session_state:
+                    avp = st.session_state["avp"]
+                    issues = st.session_state["avp_issues"]
+
+                    st.success(f"✅ AvP рассчитан: {len(avp)} строк")
+
+                    # === Сводные таблицы ===
+                    st.markdown("## Сводные таблицы")
+
+                    total_quota = avp["Кол-во анкет"].sum()
+
+                    # Таблица 1: по категориям
+                    t1 = avp.groupby("Категория new")["Кол-во анкет"].sum().reset_index()
+                    t1.columns = ["Категория", "Квота (кол-во анкет)"]
+                    t1["% от общей квоты"] = (t1["Квота (кол-во анкет)"] / total_quota * 100).round(2)
+                    t1 = t1.sort_values("Категория")
+
+                    # Таблица 2: по категориям с КФ доезда
+                    avp["_cat_with_kf_display"] = avp["_cat_with_kf"]
+                    t2 = avp.groupby("_cat_with_kf_display")["Кол-во анкет"].sum().reset_index()
+                    t2.columns = ["Категория", "Квота (кол-во анкет)"]
+                    t2["% от общей квоты"] = (t2["Квота (кол-во анкет)"] / total_quota * 100).round(2)
+                    t2 = t2.sort_values("Категория")
+
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.markdown("### По категориям")
+                        st.dataframe(t1, use_container_width=True, hide_index=True)
+                    with col2:
+                        st.markdown("### По категориям с КФ доезда")
+                        st.dataframe(t2, use_container_width=True, hide_index=True)
+
+                    # === Скачивание AvP ===
+                    buf_avp = io.BytesIO()
+                    with pd.ExcelWriter(buf_avp, engine="openpyxl") as writer:
+                        avp.to_excel(writer, sheet_name="AvP", index=False)
+
+                    st.download_button(
+                        "⬇ Скачать AvP.xlsx",
+                        buf_avp.getvalue(),
+                        "AvP.xlsx",
+                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    )
     else:
         if not user_file:
             st.info("Загрузите список НП (блок 1).")
